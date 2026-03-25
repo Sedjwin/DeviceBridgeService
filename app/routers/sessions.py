@@ -4,6 +4,9 @@ import json
 import time
 import asyncio
 import base64
+import io
+import struct
+import wave
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -43,6 +46,112 @@ def _materialize_audio_output(device_id: str, session_id: str, audio_base64: str
     _write_file(wav_path, audio_bytes)
     _write_file(b64_path, audio_base64.encode("utf-8"))
     return wav_path, len(audio_bytes)
+
+
+def _choose_sample_rate(caps: dict, source_rate: int | None) -> int | None:
+    supported = [int(x) for x in caps.get("sample_rates", []) if int(x) > 0]
+    preferred = caps.get("preferred_sample_rate")
+    if preferred is not None:
+        try:
+            preferred_i = int(preferred)
+            if preferred_i > 0 and (not supported or preferred_i in supported):
+                return preferred_i
+        except (TypeError, ValueError):
+            pass
+    if source_rate and source_rate > 0:
+        if not supported:
+            return int(source_rate)
+        return min(supported, key=lambda rate: abs(rate - int(source_rate)))
+    if supported:
+        return supported[0]
+    return source_rate
+
+
+def _wav_resample(audio_bytes: bytes, target_rate: int | None) -> tuple[bytes, int | None]:
+    if not target_rate or target_rate <= 0:
+        return audio_bytes, None
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            source_rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+        if source_rate == target_rate:
+            return audio_bytes, source_rate
+        if channels != 1 or sampwidth != 2:
+            return audio_bytes, source_rate
+        samples = struct.unpack(f"<{len(frames) // 2}h", frames)
+        if not samples:
+            return audio_bytes, source_rate
+        out_count = max(1, int(round(len(samples) * target_rate / source_rate)))
+        converted_samples: list[int] = []
+        if len(samples) == 1:
+            converted_samples = [samples[0]] * out_count
+        else:
+            scale = (len(samples) - 1) / max(1, out_count - 1)
+            for idx in range(out_count):
+                src_pos = idx * scale
+                left = int(src_pos)
+                right = min(left + 1, len(samples) - 1)
+                frac = src_pos - left
+                value = int(round(samples[left] * (1.0 - frac) + samples[right] * frac))
+                converted_samples.append(max(-32768, min(32767, value)))
+        converted = struct.pack(f"<{len(converted_samples)}h", *converted_samples)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(sampwidth)
+            wf.setframerate(target_rate)
+            wf.writeframes(converted)
+        return out.getvalue(), target_rate
+    except Exception:
+        return audio_bytes, None
+
+
+def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sample_rate: int | None) -> tuple[str, dict, int]:
+    caps = store.device_capabilities_dict(device)
+    audio_bytes = base64.b64decode(audio_base64)
+    target_rate = _choose_sample_rate(caps, sample_rate)
+    adapted_bytes, adapted_rate = _wav_resample(audio_bytes, target_rate)
+    adapted_b64 = base64.b64encode(adapted_bytes).decode("ascii")
+    audio_path, audio_size = _materialize_audio_output(device.device_id, session_id, adapted_b64)
+
+    methods = [str(x).strip().lower() for x in caps.get("audio_methods", []) if str(x).strip()]
+    if not methods:
+        methods = ["inline", "url"]
+    preferred_method = str(caps.get("preferred_audio_method", "") or "").strip().lower()
+    max_inline_audio_bytes = caps.get("max_inline_audio_bytes")
+    try:
+        inline_limit = int(max_inline_audio_bytes) if max_inline_audio_bytes is not None else settings.device_inline_audio_max_bytes
+    except (TypeError, ValueError):
+        inline_limit = settings.device_inline_audio_max_bytes
+
+    use_inline = "inline" in methods and (preferred_method == "inline" or "url" not in methods or audio_size <= inline_limit)
+    if use_inline:
+        return (
+            "audio.play",
+            {
+                "session_id": session_id,
+                "audio_base64": adapted_b64,
+                "sample_rate": adapted_rate or sample_rate,
+            },
+            audio_size,
+        )
+
+    relative_path = f"/api/device/sessions/{session_id}/audio/{audio_path.name}"
+    return (
+        "audio.play_url",
+        {
+            "session_id": session_id,
+            "url": f"{settings.public_base_url.rstrip('/')}{relative_path}",
+            "path": relative_path,
+            "sample_rate": adapted_rate or sample_rate,
+            "content_type": "audio/wav",
+            "bytes": audio_size,
+            "prebuffer_ms": caps.get("stream_prebuffer_ms"),
+        },
+        audio_size,
+    )
 
 
 def _compress_visemes(timeline: list) -> list[dict]:
@@ -100,30 +209,14 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
     row = await store.get_bridge_session(db, session_id=session_id)
     if row is None or not row.active:
         raise HTTPException(status_code=404, detail="session not found")
+    device = await db.get(Device, row.device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="device not found")
 
     await _emit_debug(session_id, "audio_start", {"bytes_b64": len(payload.audio_base64)})
-    audio_path, audio_size = _materialize_audio_output(row.device_id, session_id, payload.audio_base64)
-
-    if audio_size <= settings.device_inline_audio_max_bytes:
-        command_type = "audio.play"
-        command_payload = {
-            "session_id": session_id,
-            "audio_base64": payload.audio_base64,
-            "sample_rate": payload.sample_rate,
-            "visemes": _compress_visemes(payload.visemes),
-        }
-    else:
-        relative_path = f"/api/device/sessions/{session_id}/audio/{audio_path.name}"
-        command_type = "audio.play_url"
-        command_payload = {
-            "session_id": session_id,
-            "url": f"{settings.public_base_url.rstrip('/')}{relative_path}",
-            "path": relative_path,
-            "sample_rate": payload.sample_rate,
-            "content_type": "audio/wav",
-            "bytes": audio_size,
-            "visemes": _compress_visemes(payload.visemes),
-        }
+    command_type, command_payload, audio_size = _prepare_device_audio(device, session_id, payload.audio_base64, payload.sample_rate)
+    command_payload["visemes"] = _compress_visemes(payload.visemes)
+    audio_path = DATA_ROOT / row.device_id / "sessions" / session_id / "audio_out" / "reply.wav"
 
     command_id = await hub.dispatch_command(
         row.device_id,

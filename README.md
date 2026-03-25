@@ -110,8 +110,12 @@ Handshake:
 Commands are issued with `command_id`; device must return `ack` or `nack`.
 
 Audio return path:
-- Small replies can be sent inline as `audio.play`
-- Large replies are sent as `audio.play_url` so the device fetches WAV over HTTP instead of receiving multi-megabyte websocket payloads
+- Device advertises `audio_methods`, `sample_rates`, `preferred_sample_rate`, and optional `max_inline_audio_bytes`
+- DBS chooses the reply transport per device from that manifest
+- DBS resamples returned WAV audio to the nearest supported device rate before dispatch
+- Current methods:
+  - `inline`: `audio.play`
+  - `url`: `audio.play_url`
 
 ## Running Locally
 
@@ -158,8 +162,9 @@ Example pattern:
 3. Device sends `ptt.start`, streams `mic.chunk` while held, then sends `ptt.stop` on release.
 4. DBS creates/uses an AgentManager session, forwards WAV audio, receives agent response.
 5. DBS translates timeline and dispatches avatar/audio commands back to device.
-6. Large TTS replies are materialized under `audio_out/` and served back to the device via URL.
-7. DBS stores input/output artifacts under `data/devices/{device_id}/sessions/{bridge_session_id}/`.
+6. DBS negotiates audio transport/rate from device capabilities and adapts returned audio accordingly.
+7. Large TTS replies can be materialized under `audio_out/` and served back to the device via URL.
+8. DBS stores input/output artifacts under `data/devices/{device_id}/sessions/{bridge_session_id}/`.
 
 ## Admin Workflow
 

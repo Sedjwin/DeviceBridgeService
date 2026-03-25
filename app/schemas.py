@@ -10,8 +10,13 @@ class DeviceCapabilities(BaseModel):
     frame_budget_ms: int = 33
     texture_kb: int = 512
     animations: list[str] = Field(default_factory=lambda: ["neutral_blink"])
+    audio_methods: list[str] = Field(default_factory=lambda: ["inline", "url"])
     audio_codecs: list[str] = Field(default_factory=lambda: ["wav"])
     sample_rates: list[int] = Field(default_factory=lambda: [22050])
+    preferred_sample_rate: int | None = None
+    preferred_audio_method: str | None = None
+    max_inline_audio_bytes: int | None = None
+    stream_prebuffer_ms: int | None = None
     mic_enabled: bool = True
     mic_format: str = "pcm16"
     accepts_model_directives: bool = False

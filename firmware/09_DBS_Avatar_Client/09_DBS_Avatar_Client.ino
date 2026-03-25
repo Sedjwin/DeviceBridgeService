@@ -323,10 +323,17 @@ static void sendHello() {
 
   JsonArray audioCodecs = caps.createNestedArray("audio_codecs");
   audioCodecs.add("wav");
+  JsonArray audioMethods = caps.createNestedArray("audio_methods");
+  audioMethods.add("inline");
+  audioMethods.add("url");
   JsonArray sampleRates = caps.createNestedArray("sample_rates");
   sampleRates.add(16000);
   sampleRates.add(22050);
   sampleRates.add(24000);
+  caps["preferred_sample_rate"] = 22050;
+  caps["preferred_audio_method"] = "inline";
+  caps["max_inline_audio_bytes"] = 262144;
+  caps["stream_prebuffer_ms"] = 350;
 
   caps["mic_enabled"] = true;
   caps["mic_format"] = "pcm16";
