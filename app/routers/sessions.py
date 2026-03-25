@@ -129,7 +129,7 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
         row.device_id,
         command_type,
         command_payload,
-        require_ack=True,
+        require_ack=False,
     )
     await store.add_session_event(
         db,
@@ -218,7 +218,7 @@ async def post_agent_timeline(session_id: str, payload: AgentTimelineIn, db: Asy
 
     dispatched: list[str] = []
     for command in commands:
-        command_id = await hub.dispatch_command(row.device_id, command["type"], command["payload"], require_ack=True)
+        command_id = await hub.dispatch_command(row.device_id, command["type"], command["payload"], require_ack=False)
         dispatched.append(command_id)
 
     await store.add_session_event(

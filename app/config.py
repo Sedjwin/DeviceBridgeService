@@ -23,8 +23,8 @@ class Settings(BaseSettings):
     require_auth: bool = False
 
     device_session_timeout_s: int = 120
-    command_ack_timeout_s: float = 3.0
-    device_inline_audio_max_bytes: int = 240000
+    command_ack_timeout_s: float = 10.0
+    device_inline_audio_max_bytes: int = 2000000
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
 
