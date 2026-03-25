@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -131,6 +133,7 @@ async def admin_page() -> str:
         <button onclick=\"loadSessionFiles()\">Load Files</button>
       </div>
       <textarea id=\"eventsJson\" placeholder=\"Session events...\"></textarea>
+      <div id=\"filesLinks\" style=\"font-size:12px;max-height:220px;overflow:auto;border:1px solid #26374a;padding:8px;border-radius:8px\"></div>
       <textarea id=\"filesJson\" placeholder=\"Session files...\"></textarea>
     </section>
   </div>
@@ -276,6 +279,22 @@ async function loadSessionFiles(){
   const res=await fetch(`/api/admin/sessions/${sid}/files`);
   const data=await res.json();
   document.getElementById('filesJson').value=JSON.stringify(data, null, 2);
+  const box=document.getElementById('filesLinks');
+  box.innerHTML='';
+  (data.files||[]).forEach(f=>{
+    const row=document.createElement('div');
+    const a=document.createElement('a');
+    a.href=f.download_url;
+    a.textContent=f.path;
+    a.style.color='#7fd6ff';
+    a.target='_blank';
+    row.appendChild(a);
+    const meta=document.createElement('span');
+    meta.textContent=` (${f.size_bytes} bytes)`;
+    meta.style.color='#9cb0c3';
+    row.appendChild(meta);
+    box.appendChild(row);
+  });
 }
 
 refreshAll();
@@ -369,10 +388,22 @@ async def list_session_files(session_id: str) -> dict[str, Any]:
                 "path": str(path),
                 "size_bytes": path.stat().st_size,
                 "modified_at": path.stat().st_mtime,
+                "download_url": f"/api/admin/files/download?path={quote(str(path))}",
             }
         )
     files.sort(key=lambda x: x["path"])
     return {"session_id": session_id, "files": files}
+
+
+@router.get("/api/admin/files/download")
+async def download_file(path: str) -> FileResponse:
+    requested = Path(path).resolve()
+    root = Path("data/devices").resolve()
+    if not requested.exists() or not requested.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    if root not in requested.parents and requested != root:
+        raise HTTPException(status_code=403, detail="path not allowed")
+    return FileResponse(requested, filename=requested.name)
 
 
 @router.post("/api/admin/mappings/suggest", response_model=MappingSuggestOut)

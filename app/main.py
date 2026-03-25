@@ -176,6 +176,15 @@ async def _process_ptt_stop(device_id: str) -> None:
     state.mic_chunks.clear()
 
 
+async def _get_device_default_agent(device_id: str) -> str:
+    async with get_session_ctx() as db:
+        row = await db.get(Device, device_id)
+        if row is None:
+            return ""
+        caps = store.device_capabilities_dict(row)
+        return str(caps.get("default_agent_id", "")).strip()
+
+
 @app.websocket("/ws/device/{device_id}")
 async def ws_device(device_id: str, websocket: WebSocket) -> None:
     await hub.connect(device_id, websocket)
@@ -216,6 +225,20 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                 status = DeviceStatus.model_validate(msg)
                 async with get_session_ctx() as db:
                     await store.add_telemetry(db, device_id=device_id, payload=status.model_dump())
+                state = await runtime.get_device_state(device_id)
+                listening_flag = bool((status.extra or {}).get("listening", False))
+                if listening_flag and not state.listening:
+                    state.listening = True
+                    if not state.bridge_session_id:
+                        agent_id = await _get_device_default_agent(device_id)
+                        if agent_id:
+                            bridge_sid, upstream_sid = await _ensure_agentmanager_session(device_id, agent_id)
+                            state.bridge_session_id = bridge_sid
+                            state.upstream_session_id = upstream_sid
+                elif (not listening_flag) and state.listening:
+                    state.listening = False
+                    if state.mic_chunks:
+                        await _process_ptt_stop(device_id)
                 continue
 
             if mtype == "mic.chunk":
@@ -226,6 +249,13 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                 raw_chunk = _safe_decode_b64(audio_base64)
                 if raw_chunk:
                     state.mic_chunks.append(raw_chunk)
+
+                if not state.bridge_session_id:
+                    agent_id = await _get_device_default_agent(device_id)
+                    if agent_id:
+                        bridge_sid, upstream_sid = await _ensure_agentmanager_session(device_id, agent_id)
+                        state.bridge_session_id = bridge_sid
+                        state.upstream_session_id = upstream_sid
 
                 session_id = str(msg.get("session_id", "")) or state.bridge_session_id
                 if session_id:

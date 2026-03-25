@@ -37,7 +37,11 @@ class DeviceHub:
         for future in conn.pending_acks.values():
             if not future.done():
                 future.set_exception(TimeoutError("Device disconnected before ACK"))
-        await conn.websocket.close(code=1001)
+        try:
+            await conn.websocket.close(code=1001)
+        except Exception:
+            # Socket may already be closed by peer/ASGI lifecycle.
+            pass
 
     def is_online(self, device_id: str) -> bool:
         return device_id in self._connections
