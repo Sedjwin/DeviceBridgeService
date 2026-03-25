@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_2142
+// DBS_AVATAR_2026_03_25_2202
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,13 +24,14 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2142";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2202";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
 // ====== Globals ======
 WebSocketsClient g_ws;
 SemaphoreHandle_t g_wsMutex = nullptr;
+SemaphoreHandle_t g_wsQueueMutex = nullptr;
 I2sAudioCodec *g_audio = nullptr;
 
 volatile bool g_wsConnected = false;
@@ -113,6 +114,11 @@ static volatile uint32_t g_streamBytesReceived = 0;
 static volatile uint32_t g_streamChunkCount = 0;
 static String g_streamPhase = "idle";
 static volatile bool g_helloAcked = false;
+static constexpr size_t WS_TX_QUEUE_CAP = 128;
+static String g_wsTxQueue[WS_TX_QUEUE_CAP];
+static size_t g_wsTxHead = 0;
+static size_t g_wsTxTail = 0;
+static size_t g_wsTxCount = 0;
 
 #if LVGL_VERSION_MAJOR >= 9
 static lv_point_precise_t g_poly0[2];
@@ -132,6 +138,63 @@ static lv_point_t g_poly5[2];
 
 // ====== Utils ======
 static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode = nullptr);
+static bool wsQueuePush(const String &payload);
+static bool wsQueuePop(String &payload);
+static void wsQueueClear();
+static void wsFlushQueuedMessages();
+
+static bool wsQueuePush(const String &payload) {
+  if (!g_wsQueueMutex) {
+    return false;
+  }
+  if (!xSemaphoreTake(g_wsQueueMutex, pdMS_TO_TICKS(20))) {
+    return false;
+  }
+  if (g_wsTxCount >= WS_TX_QUEUE_CAP) {
+    xSemaphoreGive(g_wsQueueMutex);
+    return false;
+  }
+  g_wsTxQueue[g_wsTxTail] = payload;
+  g_wsTxTail = (g_wsTxTail + 1U) % WS_TX_QUEUE_CAP;
+  g_wsTxCount++;
+  xSemaphoreGive(g_wsQueueMutex);
+  return true;
+}
+
+static bool wsQueuePop(String &payload) {
+  if (!g_wsQueueMutex) {
+    return false;
+  }
+  if (!xSemaphoreTake(g_wsQueueMutex, pdMS_TO_TICKS(20))) {
+    return false;
+  }
+  if (g_wsTxCount == 0) {
+    xSemaphoreGive(g_wsQueueMutex);
+    return false;
+  }
+  payload = g_wsTxQueue[g_wsTxHead];
+  g_wsTxQueue[g_wsTxHead] = "";
+  g_wsTxHead = (g_wsTxHead + 1U) % WS_TX_QUEUE_CAP;
+  g_wsTxCount--;
+  xSemaphoreGive(g_wsQueueMutex);
+  return true;
+}
+
+static void wsQueueClear() {
+  if (!g_wsQueueMutex) {
+    return;
+  }
+  if (!xSemaphoreTake(g_wsQueueMutex, pdMS_TO_TICKS(50))) {
+    return;
+  }
+  for (size_t i = 0; i < WS_TX_QUEUE_CAP; ++i) {
+    g_wsTxQueue[i] = "";
+  }
+  g_wsTxHead = 0;
+  g_wsTxTail = 0;
+  g_wsTxCount = 0;
+  xSemaphoreGive(g_wsQueueMutex);
+}
 
 static bool wsSendJson(const JsonDocument &doc) {
   String payload;
@@ -139,12 +202,30 @@ static bool wsSendJson(const JsonDocument &doc) {
   if (!g_wsConnected) {
     return false;
   }
-  if (!xSemaphoreTake(g_wsMutex, pdMS_TO_TICKS(150))) {
-    return false;
+  return wsQueuePush(payload);
+}
+
+static void wsFlushQueuedMessages() {
+  if (!g_wsConnected) {
+    wsQueueClear();
+    return;
   }
-  bool ok = g_ws.sendTXT(payload);
-  xSemaphoreGive(g_wsMutex);
-  return ok;
+  for (int i = 0; i < 8; ++i) {
+    String payload;
+    if (!wsQueuePop(payload)) {
+      break;
+    }
+    if (!xSemaphoreTake(g_wsMutex, pdMS_TO_TICKS(50))) {
+      wsQueuePush(payload);
+      break;
+    }
+    bool ok = g_ws.sendTXT(payload);
+    xSemaphoreGive(g_wsMutex);
+    if (!ok) {
+      wsQueuePush(payload);
+      break;
+    }
+  }
 }
 
 static size_t streamBufAvailable() {
@@ -779,6 +860,7 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       g_wsConnected = false;
       g_helloAcked = false;
       g_wsDisconnectCount++;
+      wsQueueClear();
       resetAudioRuntime(false);
       setStatus("DBS disconnected");
       sendPhaseLog("error", "ws_disconnected", "WebSocket disconnected", "ws_disconnected");
@@ -1330,6 +1412,7 @@ void setup() {
   Serial.println(DBS_PORT);
 
   g_wsMutex = xSemaphoreCreateMutex();
+  g_wsQueueMutex = xSemaphoreCreateMutex();
   g_audioBufMutex = xSemaphoreCreateMutex();
   g_streamBuf = (uint8_t *)heap_caps_malloc(g_streamBufCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!g_streamBuf) {
@@ -1361,6 +1444,7 @@ void setup() {
 
 void loop() {
   g_ws.loop();
+  wsFlushQueuedMessages();
 
   uint32_t now = millis();
   if (g_wsConnected && now - g_lastStatusMs > 5000) {
