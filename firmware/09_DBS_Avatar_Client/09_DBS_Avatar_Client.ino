@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_2222
+// DBS_AVATAR_2026_03_25_2234
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2222";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2234";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -506,6 +506,22 @@ static uint32_t playbackBytesPerSecond() {
   return (uint32_t)g_playbackSampleRate * (uint32_t)g_playbackChannels * ((uint32_t)g_playbackBitsPerSample / 8U);
 }
 
+static void setInputFormat(uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample) {
+  if (sampleRate < 8000 || sampleRate > 48000) {
+    sampleRate = 16000;
+  }
+  if (channels < 1 || channels > 2) {
+    channels = 1;
+  }
+  if (bitsPerSample != 16) {
+    bitsPerSample = 16;
+  }
+  g_audio->I2sAudio_CloseMic();
+  g_audio->I2sAudio_CloseSpeaker();
+  g_audio->I2sAudio_SetCodecInfo("es7210", 1, sampleRate, channels, bitsPerSample);
+  Serial.printf("Audio in format: %lu Hz, %u ch, %u-bit\n", (unsigned long)sampleRate, channels, bitsPerSample);
+}
+
 static void setOutputFormat(uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample) {
   if (sampleRate < 8000 || sampleRate > 48000) {
     sampleRate = 24000;
@@ -519,7 +535,9 @@ static void setOutputFormat(uint32_t sampleRate, uint8_t channels, uint8_t bitsP
   g_playbackSampleRate = sampleRate;
   g_playbackChannels = channels;
   g_playbackBitsPerSample = bitsPerSample;
-  g_audio->I2sAudio_SetCodecInfo("mic&spk", 1, sampleRate, channels, bitsPerSample);
+  g_audio->I2sAudio_CloseMic();
+  g_audio->I2sAudio_CloseSpeaker();
+  g_audio->I2sAudio_SetCodecInfo("es8311", 1, sampleRate, channels, bitsPerSample);
   Serial.printf("Audio out format: %lu Hz, %u ch, %u-bit\n", (unsigned long)sampleRate, channels, bitsPerSample);
 }
 
@@ -554,7 +572,7 @@ static void startListening() {
   g_listening = true;
   g_listenStarted = true;
   clearVisemes();
-  setOutputFormat(24000, 2, 16);
+  setInputFormat(16000, 1, 16);
   g_anim = AVATAR_LISTEN;
   setStatus("Listening... release to stop");
   sendPhaseLog("info", "ptt_listening", "PTT start");
