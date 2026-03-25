@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_2022
+// DBS_AVATAR_2026_03_25_2142
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2022";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2142";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -383,6 +383,17 @@ static void endPlayback() {
   g_streamStartedPlayback = false;
 }
 
+static void resetAudioRuntime(bool resetStatusText) {
+  g_audioPlaying = false;
+  clearVisemes();
+  resetStreamState();
+  g_anim = AVATAR_IDLE;
+  setOutputFormat(24000, 2, 16);
+  if (resetStatusText) {
+    setStatus("Ready");
+  }
+}
+
 static void startListening() {
   g_listening = true;
   g_listenStarted = true;
@@ -401,7 +412,7 @@ static void stopListening() {
   g_listening = false;
   g_listenStarted = false;
   g_anim = AVATAR_IDLE;
-  setStatus("Ready");
+  setStatus("Processing...");
   sendPhaseLog("info", "ptt_release", "PTT stop");
   StaticJsonDocument<256> stop;
   stop["type"] = "ptt.stop";
@@ -768,13 +779,15 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       g_wsConnected = false;
       g_helloAcked = false;
       g_wsDisconnectCount++;
+      resetAudioRuntime(false);
       setStatus("DBS disconnected");
       sendPhaseLog("error", "ws_disconnected", "WebSocket disconnected", "ws_disconnected");
       break;
 
     case WStype_CONNECTED:
       g_wsConnected = true;
-      setStatus("DBS connected");
+      resetAudioRuntime(false);
+      setStatus("Registering with DBS...");
       sendPhaseLog("info", "ws_connected", "WebSocket connected");
       sendHello();
       break;
@@ -789,7 +802,7 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       const char *msgType = doc["type"] | "";
       if (strcmp(msgType, "hello.ack") == 0) {
         g_helloAcked = true;
-        setStatus("Device registered");
+        setStatus("Ready");
         sendPhaseLog("info", "registered", "Device hello acknowledged");
         return;
       }
