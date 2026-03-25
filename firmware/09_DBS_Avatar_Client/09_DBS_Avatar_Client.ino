@@ -453,6 +453,7 @@ static bool playAudioBase64(const char *audioB64, uint32_t sampleRate) {
 
 static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   if (!url || strlen(url) == 0 || WiFi.status() != WL_CONNECTED) {
+    g_lastError = "audio_url_invalid";
     return false;
   }
 
@@ -464,16 +465,19 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   if (strncmp(url, "https://", 8) == 0) {
     secureClient.setInsecure();
     if (!http.begin(secureClient, url)) {
+      g_lastError = "http_begin_failed_https";
       return false;
     }
   } else {
     if (!http.begin(plainClient, url)) {
+      g_lastError = "http_begin_failed_http";
       return false;
     }
   }
 
   int status = http.GET();
   if (status != HTTP_CODE_OK) {
+    g_lastError = String("http_status_") + String(status);
     http.end();
     return false;
   }
@@ -481,79 +485,59 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   setOutputSampleRate(sampleRate);
 
   WiFiClient *stream = http.getStreamPtr();
-  int total = http.getSize();
-  uint8_t *buffer = nullptr;
-  if (total > 0) {
-    buffer = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buffer) {
-      buffer = (uint8_t *)malloc(total);
-    }
-  }
-
-  if (buffer && total > 0) {
-    size_t readBytes = 0;
-    while (http.connected() && readBytes < (size_t)total) {
-      size_t avail = stream->available();
-      if (!avail) {
-        delay(2);
-        continue;
-      }
-      int got = stream->readBytes(buffer + readBytes, avail);
-      if (got <= 0) {
+  static uint8_t streamBuf[1024];
+  bool firstChunk = true;
+  uint8_t headerBuf[96];
+  size_t headerLen = 0;
+  size_t skip = 0;
+  size_t bytesPlayed = 0;
+  uint32_t idleLoops = 0;
+  beginPlayback(g_playbackSampleRate);
+  while (http.connected()) {
+    size_t avail = stream->available();
+    if (!avail) {
+      idleLoops++;
+      if (idleLoops > 3000) {
+        g_lastError = "audio_stream_timeout";
         break;
       }
-      readBytes += (size_t)got;
+      delay(2);
+      continue;
     }
-    if (readBytes > 0) {
-      playPcmBuffer(buffer, readBytes);
+    idleLoops = 0;
+    int got = stream->readBytes(streamBuf, min(avail, sizeof(streamBuf)));
+    if (got <= 0) {
+      g_lastError = "audio_stream_read_failed";
+      break;
+    }
+    if (firstChunk) {
+      size_t copyLen = (size_t)got < sizeof(headerBuf) ? (size_t)got : sizeof(headerBuf);
+      memcpy(headerBuf, streamBuf, copyLen);
+      headerLen = copyLen;
+      skip = wavPayloadOffset(headerBuf, headerLen);
+      firstChunk = false;
+      if (skip >= (size_t)got) {
+        continue;
+      }
+    }
+    size_t start = skip;
+    skip = 0;
+    if (start < (size_t)got) {
+      uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+      updateVisemeProgress(elapsedMs);
+      g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
+      bytesPlayed += ((size_t)got - start);
       ok = true;
     }
-    free(buffer);
-  } else {
-    static uint8_t streamBuf[1024];
-    bool firstChunk = true;
-    uint8_t headerBuf[96];
-    size_t headerLen = 0;
-    size_t skip = 0;
-    size_t bytesPlayed = 0;
-    beginPlayback(g_playbackSampleRate);
-    while (http.connected()) {
-      size_t avail = stream->available();
-      if (!avail) {
-        if (!http.connected()) {
-          break;
-        }
-        delay(2);
-        continue;
-      }
-      int got = stream->readBytes(streamBuf, min(avail, sizeof(streamBuf)));
-      if (got <= 0) {
-        break;
-      }
-      if (firstChunk) {
-        size_t copyLen = (size_t)got < sizeof(headerBuf) ? (size_t)got : sizeof(headerBuf);
-        memcpy(headerBuf, streamBuf, copyLen);
-        headerLen = copyLen;
-        skip = wavPayloadOffset(headerBuf, headerLen);
-        firstChunk = false;
-        if (skip >= (size_t)got) {
-          continue;
-        }
-      }
-      size_t start = skip;
-      skip = 0;
-      if (start < (size_t)got) {
-        uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
-        updateVisemeProgress(elapsedMs);
-        g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
-        bytesPlayed += ((size_t)got - start);
-        ok = true;
-      }
-    }
-    endPlayback();
   }
+  endPlayback();
 
   http.end();
+  if (ok) {
+    g_lastError = "";
+  } else if (g_lastError.length() == 0) {
+    g_lastError = "audio_stream_empty";
+  }
   return ok;
 }
 
