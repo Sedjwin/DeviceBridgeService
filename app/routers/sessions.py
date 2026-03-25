@@ -9,9 +9,11 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import get_db
+from app.config import settings
 from app.models import Device
 from app.schemas import AgentAudioIn, AgentOutputIn, AgentTimelineIn, SessionOut, SessionStartIn, SessionStopOut
 from app.services.device_hub import hub
+from app.services.llm_mapper import suggest_rules_with_llm
 from app.services.mapping import MappingContext, MappingEngine
 from app.services.runtime import runtime
 from app.services import store
@@ -85,9 +87,55 @@ async def post_agent_timeline(session_id: str, payload: AgentTimelineIn, db: Asy
 
     mapping_row = await store.get_or_create_mapping(db, agent_id=row.agent_id, device_id=row.device_id)
     emotion_map, action_map = store.parse_mapping(mapping_row)
+    caps = store.device_capabilities_dict(device)
+    animations = [str(x) for x in caps.get("animations", ["neutral_blink"])]
+    supported_modes = [str(x) for x in caps.get("render_modes", ["line"])]
+    passthrough_model_tags = bool(caps.get("accepts_model_directives", False))
+
+    unknown_emotions = sorted(
+        {
+            str(ev.value)
+            for ev in payload.timeline
+            if ev.type == "emotion" and str(ev.value) not in emotion_map
+        }
+    )
+    unknown_actions = sorted(
+        {
+            str(ev.value)
+            for ev in payload.timeline
+            if ev.type == "action" and str(ev.value) not in action_map
+        }
+    )
+
+    if settings.mapping_llm_on_miss and (unknown_emotions or unknown_actions):
+        new_emotions = await suggest_rules_with_llm(
+            source_type="emotion",
+            labels=unknown_emotions,
+            animations=animations,
+            supported_modes=supported_modes,
+            preferred_render_mode=mapping_row.preferred_render_mode,
+            passthrough_model_tags=passthrough_model_tags,
+        )
+        new_actions = await suggest_rules_with_llm(
+            source_type="action",
+            labels=unknown_actions,
+            animations=animations,
+            supported_modes=supported_modes,
+            preferred_render_mode=mapping_row.preferred_render_mode,
+            passthrough_model_tags=passthrough_model_tags,
+        )
+        emotion_map.update(new_emotions)
+        action_map.update(new_actions)
+        mapping_row = await store.save_mapping(
+            db,
+            mapping=mapping_row,
+            preferred_render_mode=mapping_row.preferred_render_mode,
+            emotion_map=emotion_map,
+            action_map=action_map,
+        )
 
     ctx = MappingContext(
-        device_capabilities=store.device_capabilities_dict(device),
+        device_capabilities=caps,
         preferred_render_mode=mapping_row.preferred_render_mode,
         emotion_map=emotion_map,
         action_map=action_map,

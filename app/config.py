@@ -9,6 +9,12 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./data/devicebridge.db"
 
+    ai_gateway_url: str = "http://localhost:8001"
+    system_basic_token: str = ""
+    system_basic_model: str = "system_basic"
+    mapping_llm_enabled: bool = True
+    mapping_llm_on_miss: bool = True
+
     agentmanager_url: str = "http://localhost:8003"
     usermanager_url: str = "http://localhost:8005"
     usermanager_service_key: str = "change-me-service-key"

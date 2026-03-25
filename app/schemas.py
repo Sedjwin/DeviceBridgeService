@@ -14,6 +14,8 @@ class DeviceCapabilities(BaseModel):
     sample_rates: list[int] = Field(default_factory=lambda: [22050])
     mic_enabled: bool = True
     mic_format: str = "pcm16"
+    accepts_model_directives: bool = False
+    default_agent_id: str = ""
 
 
 class DeviceUpsert(BaseModel):

@@ -31,6 +31,7 @@ Open `09_DBS_Avatar_Client.ino` and edit:
 - `DBS_PORT`
 - `DBS_USE_SSL`
 - `DEVICE_ID`
+- `DEFAULT_AGENT_ID` (optional; leave empty if device capability `default_agent_id` is set in DBS admin)
 
 Default is configured for public DBS over TLS:
 - host: `chip.iampc.uk`
@@ -45,6 +46,10 @@ Default is configured for public DBS over TLS:
 ## Runtime Notes
 - If DBS is local-only/non-TLS, set `DBS_USE_SSL=false` and point to `8011`.
 - Microphone chunks are sent as `mic.chunk` JSON frames with base64 PCM payload.
+- Touch behavior:
+  - Press: sends `ptt.start`
+  - Hold: streams `mic.chunk`
+  - Release: sends `ptt.stop` (DBS forwards captured audio to AgentManager and returns response audio + avatar timeline)
 - The sketch currently advertises these animations:
   - `neutral_blink`
   - `head_tilt`

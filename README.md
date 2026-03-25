@@ -108,6 +108,7 @@ Commands are issued with `command_id`; device must return `ack` or `nack`.
 
 ```bash
 cd /home/sedjwin/DeviceBridgeService
+cp .env.example .env
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -144,11 +145,11 @@ Example pattern:
 ## Example Integration Flow
 
 1. ESP32 connects and registers capabilities.
-2. Create mapping for `(agent_id, device_id)`.
-3. Start bridge session.
-4. Post AgentManager timeline/audio output to `/agent-output`.
-5. Service translates to device commands and waits for ACKs.
-6. Device sends `mic.chunk`; integration layer reads `/api/sessions/{id}/mic` and forwards to AgentManager/AIGateway voice path.
+2. Set `default_agent_id` for the device in admin capability config (or send `agent_id` in `ptt.start`).
+3. Device sends `ptt.start`, streams `mic.chunk` while held, then sends `ptt.stop` on release.
+4. DBS creates/uses an AgentManager session, forwards WAV audio, receives agent response.
+5. DBS translates timeline and dispatches avatar/audio commands back to device.
+6. DBS stores input/output artifacts under `data/devices/{device_id}/sessions/{bridge_session_id}/`.
 
 ## Admin Workflow
 
@@ -158,6 +159,12 @@ Example pattern:
 4. Generate suggested emotion/action mapping from agent profile to device animations.
 5. Review/edit JSON mapping and save.
 6. Use per-device disconnect control for operational recovery.
+
+## Mapping Resolution
+
+- Config-time suggestion: `/api/admin/mappings/suggest` uses `system_basic` via AIGateway when `SYSTEM_BASIC_TOKEN` is set.
+- Runtime on miss: unseen emotion/action tags can be mapped on demand with LLM and persisted to the mapping table.
+- Passthrough mode: set `accepts_model_directives=true` in device capabilities to preserve model-side labels directly.
 
 ## Testing
 

@@ -18,6 +18,7 @@ static const bool DBS_USE_SSL = true;
 static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
+static const char *DEFAULT_AGENT_ID = "";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -253,6 +254,11 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         setStatus("Device registered");
         return;
       }
+      if (strcmp(msgType, "ptt.ready") == 0) {
+        g_sessionId = String((const char *)(doc["session_id"] | ""));
+        setStatus("Listening... release to stop");
+        return;
+      }
 
       const char *commandId = doc["command_id"] | "";
 
@@ -380,10 +386,18 @@ static void pttEvent(lv_event_t *e) {
     g_listening = true;
     g_anim = AVATAR_LISTEN;
     setStatus("Listening... release to stop");
+    StaticJsonDocument<256> start;
+    start["type"] = "ptt.start";
+    start["agent_id"] = DEFAULT_AGENT_ID;
+    wsSendJson(start);
   } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
     g_listening = false;
     g_anim = AVATAR_IDLE;
     setStatus("Ready");
+    StaticJsonDocument<256> stop;
+    stop["type"] = "ptt.stop";
+    stop["session_id"] = g_sessionId;
+    wsSendJson(stop);
   }
 }
 

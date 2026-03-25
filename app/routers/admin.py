@@ -13,7 +13,7 @@ from app.models import Device
 from app.schemas import AgentSummary, MappingOut, MappingSuggestIn, MappingSuggestOut
 from app.services import store
 from app.services.device_hub import hub
-from app.services.mapping import suggest_rule_for_label
+from app.services.llm_mapper import suggest_rules_with_llm
 
 router = APIRouter(tags=["admin"])
 
@@ -85,6 +85,8 @@ async def admin_page() -> str:
       <h2>Add / Update Device</h2>
       <div class=\"row\"><input id=\"devId\" placeholder=\"device_id\" /><input id=\"devName\" placeholder=\"name\" /><input id=\"devModel\" placeholder=\"model\" /></div>
       <div class=\"row\"><input id=\"devFw\" placeholder=\"firmware\" value=\"0.1.0\" /><input id=\"devModes\" value=\"line,shape\" placeholder=\"render modes\" /><input id=\"devAnims\" value=\"neutral_blink,head_tilt,scan_sweep\" placeholder=\"animations\" /></div>
+      <div class=\"row\"><input id=\"devAgent\" placeholder=\"default agent_id for PTT\" style=\"min-width:320px\" /></div>
+      <div class=\"row\"><label><input type=\"checkbox\" id=\"devPassthrough\" /> accepts model directives directly</label></div>
       <div class=\"row\"><button onclick=\"saveDevice()\" class=\"good\">Save Device Capabilities</button></div>
     </section>
 
@@ -156,7 +158,9 @@ async function saveDevice(){
       audio_codecs: ['wav'],
       sample_rates: [22050],
       mic_enabled: true,
-      mic_format: 'pcm16'
+      mic_format: 'pcm16',
+      accepts_model_directives: document.getElementById('devPassthrough').checked,
+      default_agent_id: (document.getElementById('devAgent').value || '').trim()
     }
   };
   const res=await fetch(`/api/devices/${device_id}/capabilities`, {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
@@ -277,28 +281,27 @@ async def suggest_mapping(payload: MappingSuggestIn, db: AsyncSession = Depends(
     caps = store.device_capabilities_dict(device)
     animations = [str(x) for x in caps.get("animations", ["neutral_blink"])]
     supported_modes = [str(x) for x in caps.get("render_modes", ["line"])]
+    passthrough_model_tags = bool(caps.get("accepts_model_directives", False))
 
     emotions, actions = _extract_agent_taxonomy(agent.profile)
     preferred_render_mode = payload.preferred_render_mode or (supported_modes[0] if supported_modes else "line")
 
-    emotion_map = {
-        label: suggest_rule_for_label(
-            label,
-            animations,
-            preferred_render_mode=preferred_render_mode,
-            supported_modes=supported_modes,
-        )
-        for label in emotions
-    }
-    action_map = {
-        label: suggest_rule_for_label(
-            label,
-            animations,
-            preferred_render_mode=preferred_render_mode,
-            supported_modes=supported_modes,
-        )
-        for label in actions
-    }
+    emotion_map = await suggest_rules_with_llm(
+        source_type="emotion",
+        labels=emotions,
+        animations=animations,
+        supported_modes=supported_modes,
+        preferred_render_mode=preferred_render_mode,
+        passthrough_model_tags=passthrough_model_tags,
+    )
+    action_map = await suggest_rules_with_llm(
+        source_type="action",
+        labels=actions,
+        animations=animations,
+        supported_modes=supported_modes,
+        preferred_render_mode=preferred_render_mode,
+        passthrough_model_tags=passthrough_model_tags,
+    )
 
     return MappingSuggestOut(
         agent_id=payload.agent_id,

@@ -74,13 +74,80 @@ def _normalize_name(value: str) -> str:
     return value.strip().lower().replace("-", "_").replace(" ", "_")
 
 
+def _tokens(value: str) -> set[str]:
+    return {tok for tok in _normalize_name(value).split("_") if tok}
+
+
+EMOTION_ALIASES: dict[str, set[str]] = {
+    "happy": {"happy", "joy", "pleased", "satisfied"},
+    "sad": {"sad", "down", "unhappy"},
+    "angry": {"angry", "irritated", "annoyed"},
+    "curious": {"curious", "interested", "inquisitive"},
+    "bored": {"bored", "idle", "neutral"},
+}
+
+ACTION_ALIASES: dict[str, set[str]] = {
+    "scan": {"scan", "sweep", "analyze"},
+    "blink": {"blink", "eye"},
+    "tilt": {"tilt", "lean", "angle"},
+    "talk": {"talk", "speak", "mouth"},
+    "idle": {"idle", "rest", "standby"},
+}
+
+
+def _semantic_score(label: str, animation: str, source_type: str) -> int:
+    n_label = _normalize_name(label)
+    n_anim = _normalize_name(animation)
+    if n_label == n_anim:
+        return 100
+
+    score = 0
+    if n_label in n_anim or n_anim in n_label:
+        score += 35
+
+    label_tokens = _tokens(label)
+    anim_tokens = _tokens(animation)
+    overlap = len(label_tokens.intersection(anim_tokens))
+    score += overlap * 15
+
+    alias_table = EMOTION_ALIASES if source_type == "emotion" else ACTION_ALIASES
+    for alias_set in alias_table.values():
+        if label_tokens.intersection(alias_set) and anim_tokens.intersection(alias_set):
+            score += 20
+            break
+
+    return score
+
+
+def _pick_render_mode(preferred_render_mode: str, supported_modes: list[str], animation: str) -> str | None:
+    if preferred_render_mode in supported_modes:
+        return preferred_render_mode
+    anim_tokens = _tokens(animation)
+    if "line" in anim_tokens and "line" in supported_modes:
+        return "line"
+    if "shape" in anim_tokens and "shape" in supported_modes:
+        return "shape"
+    if ("photo" in anim_tokens or "warp" in anim_tokens) and "photo_warp" in supported_modes:
+        return "photo_warp"
+    if ("3d" in anim_tokens or "mesh" in anim_tokens or "model" in anim_tokens) and "model3d" in supported_modes:
+        return "model3d"
+    return supported_modes[0] if supported_modes else None
+
+
 def suggest_rule_for_label(
     label: str,
     animations: list[str],
     *,
+    source_type: str,
     preferred_render_mode: str,
     supported_modes: list[str],
+    passthrough_model_tags: bool = False,
 ) -> MappingRule:
+    if passthrough_model_tags:
+        # Device can interpret model-side directives directly.
+        render_mode = _pick_render_mode(preferred_render_mode, supported_modes, label)
+        return MappingRule(animation=_normalize_name(label), render_mode=render_mode, fallback=[DEFAULT_FALLBACK])
+
     normalized_label = _normalize_name(label)
     normalized_animations = {_normalize_name(name): name for name in animations}
 
@@ -88,10 +155,12 @@ def suggest_rule_for_label(
         target = normalized_animations[normalized_label]
     else:
         target = ""
-        for norm, original in normalized_animations.items():
-            if normalized_label in norm or norm in normalized_label:
+        best_score = -1
+        for _, original in normalized_animations.items():
+            score = _semantic_score(label, original, source_type)
+            if score > best_score:
+                best_score = score
                 target = original
-                break
         if not target:
             for candidate in ("neutral_blink", "idle", DEFAULT_FALLBACK):
                 if candidate in animations:
@@ -102,6 +171,6 @@ def suggest_rule_for_label(
         if not target:
             target = DEFAULT_FALLBACK
 
-    render_mode = preferred_render_mode if preferred_render_mode in supported_modes else None
+    render_mode = _pick_render_mode(preferred_render_mode, supported_modes, target)
     fallback = [DEFAULT_FALLBACK] if target != DEFAULT_FALLBACK else []
     return MappingRule(animation=target, render_mode=render_mode, fallback=fallback)
