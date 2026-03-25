@@ -17,6 +17,7 @@ class DeviceConnection:
     websocket: WebSocket
     connected_at: float = field(default_factory=time.time)
     pending_acks: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class DeviceHub:
@@ -51,6 +52,13 @@ class DeviceHub:
         data = await conn.websocket.receive_text()
         return json.loads(data)
 
+    async def send_binary(self, device_id: str, payload: bytes) -> None:
+        conn = self._connections.get(device_id)
+        if not conn:
+            raise RuntimeError(f"Device {device_id} is not connected")
+        async with conn.send_lock:
+            await conn.websocket.send_bytes(payload)
+
     async def dispatch_command(
         self,
         device_id: str,
@@ -70,7 +78,8 @@ class DeviceHub:
             ack_future = asyncio.get_running_loop().create_future()
             conn.pending_acks[command_id] = ack_future
 
-        await conn.websocket.send_json(msg)
+        async with conn.send_lock:
+            await conn.websocket.send_json(msg)
 
         if require_ack and ack_future is not None:
             try:

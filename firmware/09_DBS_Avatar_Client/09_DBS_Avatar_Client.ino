@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_1848
+// DBS_AVATAR_2026_03_25_1904
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1848";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1904";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -96,7 +96,7 @@ static uint32_t g_playbackSampleRate = 16000;
 static String g_lastError = "";
 static SemaphoreHandle_t g_audioBufMutex = nullptr;
 static uint8_t *g_streamBuf = nullptr;
-static size_t g_streamBufCap = 65536;
+static size_t g_streamBufCap = 131072;
 static size_t g_streamReadPos = 0;
 static size_t g_streamWritePos = 0;
 static size_t g_streamBuffered = 0;
@@ -416,7 +416,7 @@ static void sendHello() {
   caps["preferred_sample_rate"] = 22050;
   caps["preferred_audio_method"] = "ws_stream";
   caps["max_inline_audio_bytes"] = 262144;
-  caps["stream_prebuffer_ms"] = 350;
+  caps["stream_prebuffer_ms"] = 1200;
 
   caps["mic_enabled"] = true;
   caps["mic_format"] = "pcm16";
@@ -440,7 +440,11 @@ static void sendDeviceStatus() {
   StaticJsonDocument<256> st;
   st["type"] = "device.status";
   st["fps"] = 30.0;
-  st["buffer_level"] = g_listening ? 0.8 : 0.2;
+  float bufferLevel = 0.0f;
+  if (g_streamBufCap > 0) {
+    bufferLevel = (float)streamBufAvailable() / (float)g_streamBufCap;
+  }
+  st["buffer_level"] = g_listening ? 0.8 : bufferLevel;
   st["battery"] = 0.0;
   st["temperature_c"] = 0.0;
   JsonObject extra = st.createNestedObject("extra");
@@ -736,32 +740,6 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         return;
       }
 
-      if (strcmp(msgType, "audio.stream.chunk") == 0) {
-        const char *audioB64 = doc["payload"]["audio_base64"] | "";
-        if (strlen(audioB64) == 0) {
-          sendAck(commandId, false, "empty stream chunk");
-          return;
-        }
-        uint8_t *pcm = nullptr;
-        size_t pcmLen = 0;
-        if (!base64Decode(audioB64, &pcm, &pcmLen)) {
-          g_lastError = "audio_stream_decode_failed";
-          sendDeviceLog("error", "Audio stream decode failed", g_lastError.c_str());
-          sendAck(commandId, false, "stream decode failed");
-          return;
-        }
-        bool ok = streamBufWrite(pcm, pcmLen);
-        free(pcm);
-        if (!ok) {
-          g_lastError = "audio_stream_overflow";
-          sendDeviceLog("error", "Audio stream buffer overflow", g_lastError.c_str());
-          sendAck(commandId, false, "stream buffer overflow");
-        } else {
-          sendAck(commandId, true);
-        }
-        return;
-      }
-
       if (strcmp(msgType, "audio.stream.end") == 0) {
         g_streamEnded = true;
         sendAck(commandId, true);
@@ -797,6 +775,17 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         sendAck(commandId, false, "unsupported command");
       }
       break;
+    }
+
+    case WStype_BIN: {
+      if (!g_streamActive || length == 0) {
+        return;
+      }
+      if (!streamBufWrite(payload, length)) {
+        g_lastError = "audio_stream_overflow";
+        sendDeviceLog("error", "Audio stream buffer overflow", g_lastError.c_str());
+      }
+      return;
     }
 
     default:

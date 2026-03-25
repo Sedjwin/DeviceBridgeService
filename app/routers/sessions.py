@@ -148,8 +148,8 @@ def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sa
             "audio_size": len(pcm_bytes),
             "audio_path": audio_path,
             "pcm_bytes": pcm_bytes,
-            "prebuffer_ms": int(caps.get("stream_prebuffer_ms") or 250),
-            "chunk_bytes": 4096,
+            "prebuffer_ms": int(caps.get("stream_prebuffer_ms") or 1200),
+            "chunk_bytes": 16384,
         }
 
     use_inline = "inline" in methods and audio_size <= inline_limit and (
@@ -274,18 +274,9 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
         )
         for seq, offset in enumerate(range(0, len(pcm_bytes), chunk_bytes)):
             chunk = pcm_bytes[offset : offset + chunk_bytes]
-            await hub.dispatch_command(
-                row.device_id,
-                "audio.stream.chunk",
-                {
-                    "session_id": session_id,
-                    "seq": seq,
-                    "audio_base64": base64.b64encode(chunk).decode("ascii"),
-                },
-                require_ack=False,
-            )
-            if seq % 4 == 3:
-                await asyncio.sleep(0.005)
+            await hub.send_binary(row.device_id, chunk)
+            if seq % 8 == 7:
+                await asyncio.sleep(0)
         await hub.dispatch_command(
             row.device_id,
             "audio.stream.end",
