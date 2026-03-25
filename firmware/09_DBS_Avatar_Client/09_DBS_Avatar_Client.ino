@@ -719,16 +719,16 @@ static void updateAvatarFrame() {
     lv_obj_set_style_bg_color(g_eyeR, lv_color_hex(0xB4F7FF), 0);
     lv_obj_set_style_bg_color(g_mouth, lv_color_hex(0x57D8FF), 0);
   } else if (g_renderMode == RENDER_SHAPE) {
-    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_85, 0);
+    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_80, 0);
     lv_obj_set_style_bg_color(g_facePanel, lv_color_hex(0x113245), 0);
     for (int i = 0; i < 6; ++i) {
-      lv_obj_set_style_line_opa(g_wireLines[i], LV_OPA_25, 0);
+      lv_obj_set_style_line_opa(g_wireLines[i], LV_OPA_20, 0);
     }
     lv_obj_set_style_bg_color(g_eyeL, lv_color_hex(0xC4FBFF), 0);
     lv_obj_set_style_bg_color(g_eyeR, lv_color_hex(0xC4FBFF), 0);
     lv_obj_set_style_bg_color(g_mouth, lv_color_hex(0x7BE7FF), 0);
   } else if (g_renderMode == RENDER_CARTOON) {
-    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_95, 0);
+    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_90, 0);
     lv_obj_set_style_bg_color(g_facePanel, lv_color_hex(0x1A3952), 0);
     for (int i = 0; i < 6; ++i) {
       lv_obj_set_style_line_opa(g_wireLines[i], LV_OPA_10, 0);
@@ -740,7 +740,7 @@ static void updateAvatarFrame() {
     lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_90, 0);
     lv_obj_set_style_bg_color(g_facePanel, lv_color_hex(0x17384A), 0);
     for (int i = 0; i < 6; ++i) {
-      lv_obj_set_style_line_opa(g_wireLines[i], (i % 2 == 0) ? LV_OPA_40 : LV_OPA_18, 0);
+      lv_obj_set_style_line_opa(g_wireLines[i], (i % 2 == 0) ? LV_OPA_40 : LV_OPA_10, 0);
     }
     lv_obj_set_style_bg_color(g_eyeL, lv_color_hex(0xC2F4FF), 0);
     lv_obj_set_style_bg_color(g_eyeR, lv_color_hex(0xC2F4FF), 0);
