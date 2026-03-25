@@ -79,9 +79,9 @@ async def _schedule_legacy_stop(device_id: str, activity_token: int, delay_s: fl
         await _process_ptt_stop(device_id)
 
 
-async def _ensure_agentmanager_session(device_id: str, agent_id: str) -> tuple[str, str]:
+async def _ensure_agentmanager_session(device_id: str, agent_id: str, force_new: bool = False) -> tuple[str, str]:
     state = await runtime.get_device_state(device_id)
-    if state.bridge_session_id and state.upstream_session_id and state.agent_id == agent_id:
+    if not force_new and state.bridge_session_id and state.upstream_session_id and state.agent_id == agent_id:
         return state.bridge_session_id, state.upstream_session_id
 
     async with get_session_ctx() as db:
@@ -162,7 +162,11 @@ async def _process_ptt_stop(device_id: str) -> None:
                         state.bridge_session_id,
                         state.upstream_session_id,
                     )
-                    _, new_upstream_session_id = await _ensure_agentmanager_session(device_id, state.agent_id)
+                    _, new_upstream_session_id = await _ensure_agentmanager_session(
+                        device_id,
+                        state.agent_id,
+                        force_new=True,
+                    )
                     state.upstream_session_id = new_upstream_session_id
                     continue
                 am_res.raise_for_status()
