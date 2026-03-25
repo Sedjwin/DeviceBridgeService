@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_1836
+// DBS_AVATAR_2026_03_25_1839
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1836";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1839";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
