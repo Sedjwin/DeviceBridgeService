@@ -1,0 +1,14 @@
+[Unit]
+Description=DeviceBridgeService
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sedjwin/DeviceBridgeService
+ExecStart=/usr/bin/env bash /home/sedjwin/DeviceBridgeService/run.sh
+Restart=always
+RestartSec=3
+User=sedjwin
+
+[Install]
+WantedBy=multi-user.target
