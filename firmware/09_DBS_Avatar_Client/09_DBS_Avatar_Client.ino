@@ -11,8 +11,8 @@
 #include "src/audio_bsp/user_audio.h"
 
 // ====== USER CONFIG ======
-static const char *WIFI_SSID = "YOUR_WIFI_SSID";
-static const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+static const char *WIFI_SSID = "2xD_WiFi";
+static const char *WIFI_PASS = "Houses06";
 
 static const bool DBS_USE_SSL = true;
 static const char *DBS_HOST = "chip.iampc.uk";
@@ -55,12 +55,21 @@ enum AvatarAnim {
 
 volatile AvatarAnim g_anim = AVATAR_IDLE;
 
+#if LVGL_VERSION_MAJOR >= 9
+static lv_point_precise_t g_poly0[2];
+static lv_point_precise_t g_poly1[2];
+static lv_point_precise_t g_poly2[2];
+static lv_point_precise_t g_poly3[2];
+static lv_point_precise_t g_poly4[2];
+static lv_point_precise_t g_poly5[2];
+#else
 static lv_point_t g_poly0[2];
 static lv_point_t g_poly1[2];
 static lv_point_t g_poly2[2];
 static lv_point_t g_poly3[2];
 static lv_point_t g_poly4[2];
 static lv_point_t g_poly5[2];
+#endif
 
 // ====== Utils ======
 static bool wsSendJson(const JsonDocument &doc) {

@@ -17,8 +17,11 @@ ESP32-S3 Touch AMOLED 1.32 firmware sketch for DeviceBridgeService (DBS).
 Install via Library Manager:
 - `WebSockets` by Markus Sattler
 - `ArduinoJson` by Benoit Blanchon
+- `lvgl` (use LVGL 9.x if installed globally in Arduino libraries)
 
 Use Waveshare-provided local libraries from this repo as documented in the main README.
+
+This sketch folder now uses the LVGL v9 display port implementation (`lvgl_port.cpp`).
 
 ## Configure
 Open `09_DBS_Avatar_Client.ino` and edit:
