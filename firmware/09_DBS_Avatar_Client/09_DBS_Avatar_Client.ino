@@ -130,6 +130,8 @@ static lv_point_t g_poly5[2];
 #endif
 
 // ====== Utils ======
+static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode = nullptr);
+
 static bool wsSendJson(const JsonDocument &doc) {
   String payload;
   serializeJson(doc, payload);
