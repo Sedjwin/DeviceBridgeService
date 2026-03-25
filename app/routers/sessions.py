@@ -113,13 +113,12 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
             "visemes": _compress_visemes(payload.visemes),
         }
     else:
+        relative_path = f"/api/device/sessions/{session_id}/audio/{audio_path.name}"
         command_type = "audio.play_url"
         command_payload = {
             "session_id": session_id,
-            "url": (
-                f"{settings.public_base_url.rstrip('/')}"
-                f"/api/device/sessions/{session_id}/audio/{audio_path.name}"
-            ),
+            "url": f"{settings.public_base_url.rstrip('/')}{relative_path}",
+            "path": relative_path,
             "sample_rate": payload.sample_rate,
             "content_type": "audio/wav",
             "bytes": audio_size,

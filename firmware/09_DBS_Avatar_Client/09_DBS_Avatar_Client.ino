@@ -89,6 +89,7 @@ static volatile uint32_t g_touchStartMs = 0;
 static uint32_t g_animHoldUntilMs = 0;
 static uint32_t g_nextIdleAnimMs = 0;
 static uint32_t g_playbackSampleRate = 16000;
+static String g_lastError = "";
 
 #if LVGL_VERSION_MAJOR >= 9
 static lv_point_precise_t g_poly0[2];
@@ -357,7 +358,28 @@ static void sendDeviceStatus() {
   extra["session_id"] = g_sessionId;
   extra["render_mode"] = renderModeName(g_renderMode);
   extra["audio_playing"] = g_audioPlaying;
+  if (g_lastError.length() > 0) {
+    extra["last_error"] = g_lastError;
+  }
   wsSendJson(st);
+}
+
+static String resolveAudioUrl(const char *url, const char *path) {
+  if (!path || strlen(path) == 0) {
+    if (url && strlen(url) > 0) {
+      return String(url);
+    }
+    return String("");
+  }
+  String out = DBS_USE_SSL ? "https://" : "http://";
+  out += DBS_HOST;
+  out += ":";
+  out += String(DBS_PORT);
+  if (path[0] != '/') {
+    out += "/";
+  }
+  out += path;
+  return out;
 }
 
 static size_t wavPayloadOffset(const uint8_t *data, size_t len) {
@@ -598,14 +620,20 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       if (strcmp(msgType, "audio.play_url") == 0) {
         const char *sessionId = doc["payload"]["session_id"] | "";
         const char *url = doc["payload"]["url"] | "";
+        const char *path = doc["payload"]["path"] | "";
         uint32_t sampleRate = (uint32_t)(doc["payload"]["sample_rate"] | 16000);
         g_sessionId = String(sessionId);
 
-        if (strlen(url) > 0) {
+        String resolvedUrl = resolveAudioUrl(url, path);
+        if (resolvedUrl.length() > 0) {
           loadVisemes(doc["payload"]["visemes"]);
           sendAck(commandId, true);
-          if (!playAudioFromUrl(url, sampleRate)) {
+          if (!playAudioFromUrl(resolvedUrl.c_str(), sampleRate)) {
+            g_lastError = "audio_fetch_failed";
             setStatus("Audio fetch failed");
+            sendDeviceStatus();
+          } else {
+            g_lastError = "";
           }
         } else {
           sendAck(commandId, false, "empty audio url");
