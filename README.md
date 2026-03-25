@@ -171,6 +171,11 @@ Included tests:
 - Mapping fallback logic
 - WebSocket + REST end-to-end flow (hello, mapping, session start, timeline dispatch with ACK, mic uplink, session stop)
 
+## Firmware Starter
+
+- Waveshare sketch: [firmware/09_DBS_Avatar_Client/09_DBS_Avatar_Client.ino](firmware/09_DBS_Avatar_Client/09_DBS_Avatar_Client.ino)
+- Setup notes: [firmware/09_DBS_Avatar_Client/README.md](firmware/09_DBS_Avatar_Client/README.md)
+
 ## Current Boundaries
 
 - Rendering backends (`line`/`shape`/`photo_warp`/`model3d`) are represented as protocol-level render mode directives; final pixel rendering remains firmware-side.
