@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     mapping_llm_on_miss: bool = True
 
     agentmanager_url: str = "http://localhost:8003"
+    voiceservice_url: str = "http://localhost:8002"
     usermanager_url: str = "http://localhost:8005"
     usermanager_service_key: str = "change-me-service-key"
     require_auth: bool = False

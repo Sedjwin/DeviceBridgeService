@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AgentDeviceMapping, BridgeSession, Device, SessionEvent, TelemetrySample
@@ -55,6 +55,19 @@ async def list_devices(session: AsyncSession) -> list[Device]:
     return list(rows.scalars().all())
 
 
+async def delete_device(session: AsyncSession, *, device_id: str) -> bool:
+    device = await session.get(Device, device_id)
+    if device is None:
+        return False
+    await session.execute(delete(SessionEvent).where(SessionEvent.session_id.in_(select(BridgeSession.session_id).where(BridgeSession.device_id == device_id))))
+    await session.execute(delete(BridgeSession).where(BridgeSession.device_id == device_id))
+    await session.execute(delete(AgentDeviceMapping).where(AgentDeviceMapping.device_id == device_id))
+    await session.execute(delete(TelemetrySample).where(TelemetrySample.device_id == device_id))
+    await session.delete(device)
+    await session.commit()
+    return True
+
+
 def device_capabilities_dict(device: Device) -> dict:
     return _json_loads(device.capabilities_json)
 
@@ -72,6 +85,16 @@ async def get_or_create_mapping(session: AsyncSession, *, agent_id: str, device_
     await session.commit()
     await session.refresh(row)
     return row
+
+
+async def list_device_mappings(session: AsyncSession, *, device_id: str) -> list[AgentDeviceMapping]:
+    stmt = (
+        select(AgentDeviceMapping)
+        .where(AgentDeviceMapping.device_id == device_id)
+        .order_by(AgentDeviceMapping.updated_at.desc())
+    )
+    rows = await session.execute(stmt)
+    return list(rows.scalars().all())
 
 
 def parse_mapping(mapping: AgentDeviceMapping) -> tuple[dict[str, MappingRule], dict[str, MappingRule]]:

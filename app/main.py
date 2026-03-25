@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
@@ -39,33 +40,7 @@ app.include_router(sessions.router)
 
 @app.get("/", response_class=HTMLResponse)
 async def root_index() -> str:
-    return """<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>DeviceBridgeService</title>
-  <style>
-    body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d131a;color:#d7e3ef;margin:0}
-    .wrap{max-width:900px;margin:0 auto;padding:24px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-    a.card{display:block;padding:14px;border-radius:10px;border:1px solid #243548;background:#101a24;color:#9ed8ff;text-decoration:none}
-    p{color:#9cb0c3}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>DeviceBridgeService</h1>
-    <p>Quick access panel</p>
-    <div class="grid">
-      <a class="card" href="/admin">Admin UI</a>
-      <a class="card" href="/health">Health</a>
-      <a class="card" href="/docs">Swagger Docs</a>
-      <a class="card" href="/openapi.json">OpenAPI JSON</a>
-    </div>
-  </div>
-</body>
-</html>"""
+    return await admin.admin_page()
 
 DATA_ROOT = Path("data/devices")
 
@@ -91,6 +66,17 @@ def _pcm_to_wav(pcm_chunks: list[bytes], sample_rate: int) -> bytes:
 def _write_file(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
+
+
+async def _schedule_legacy_stop(device_id: str, activity_token: int, delay_s: float = 1.2) -> None:
+    await asyncio.sleep(delay_s)
+    state = await runtime.get_device_state(device_id)
+    if state.mic_activity_token != activity_token:
+        return
+    if state.listening:
+        return
+    if state.mic_chunks:
+        await _process_ptt_stop(device_id)
 
 
 async def _ensure_agentmanager_session(device_id: str, agent_id: str) -> tuple[str, str]:
@@ -142,12 +128,32 @@ async def _process_ptt_stop(device_id: str) -> None:
     audio_in_path = DATA_ROOT / device_id / "sessions" / state.bridge_session_id / "audio_in" / f"{turn_id}.wav"
     _write_file(audio_in_path, wav_bytes)
 
+    async with get_session_ctx() as db:
+        await store.add_session_event(
+            db,
+            session_id=state.bridge_session_id,
+            event_type="ptt.audio_in",
+            payload={"path": str(audio_in_path), "bytes": len(wav_bytes), "sample_rate": state.sample_rate},
+        )
+
     files = {"audio": ("input.wav", wav_bytes, "audio/wav")}
     am_audio_url = f"{settings.agentmanager_url.rstrip('/')}/sessions/{state.upstream_session_id}/audio"
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        am_res = await client.post(am_audio_url, files=files)
-        am_res.raise_for_status()
-        agent_resp = am_res.json()
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            am_res = await client.post(am_audio_url, files=files)
+            am_res.raise_for_status()
+            agent_resp = am_res.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ptt stop processing failed device=%s session=%s err=%s", device_id, state.bridge_session_id, exc)
+        async with get_session_ctx() as db:
+            await store.add_session_event(
+                db,
+                session_id=state.bridge_session_id,
+                event_type="ptt.error",
+                payload={"stage": "agentmanager.audio", "error": str(exc)},
+            )
+        state.mic_chunks.clear()
+        return
 
     async with get_session_ctx() as db:
         await store.add_session_event(
@@ -167,7 +173,20 @@ async def _process_ptt_stop(device_id: str) -> None:
     }
     dbs_agent_output_url = f"http://127.0.0.1:8011/api/sessions/{state.bridge_session_id}/agent-output"
     async with httpx.AsyncClient(timeout=120.0) as client:
-        await client.post(dbs_agent_output_url, json=payload)
+        response = await client.post(dbs_agent_output_url, json=payload)
+        response_errors: list[str] = []
+        try:
+            response_errors = list((response.json() or {}).get("errors", []))
+        except Exception:
+            response_errors = []
+        if response.status_code >= 400 or response_errors:
+            async with get_session_ctx() as db:
+                await store.add_session_event(
+                    db,
+                    session_id=state.bridge_session_id,
+                    event_type="ptt.error",
+                    payload={"stage": "device_dispatch", "error": response.text[:400], "errors": response_errors},
+                )
 
     if agent_resp.get("audio"):
         audio_out_path = DATA_ROOT / device_id / "sessions" / state.bridge_session_id / "audio_out" / f"{turn_id}.wav.b64"
@@ -179,10 +198,15 @@ async def _process_ptt_stop(device_id: str) -> None:
 async def _get_device_default_agent(device_id: str) -> str:
     async with get_session_ctx() as db:
         row = await db.get(Device, device_id)
-        if row is None:
-            return ""
-        caps = store.device_capabilities_dict(row)
-        return str(caps.get("default_agent_id", "")).strip()
+        if row is not None:
+            caps = store.device_capabilities_dict(row)
+            default_agent_id = str(caps.get("default_agent_id", "")).strip()
+            if default_agent_id:
+                return default_agent_id
+        mapping_rows = await store.list_device_mappings(db, device_id=device_id)
+        if len(mapping_rows) == 1:
+            return str(mapping_rows[0].agent_id)
+        return ""
 
 
 @app.websocket("/ws/device/{device_id}")
@@ -229,14 +253,18 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                 listening_flag = bool((status.extra or {}).get("listening", False))
                 if listening_flag and not state.listening:
                     state.listening = True
+                    state.mic_activity_token += 1
                     if not state.bridge_session_id:
                         agent_id = await _get_device_default_agent(device_id)
                         if agent_id:
                             bridge_sid, upstream_sid = await _ensure_agentmanager_session(device_id, agent_id)
                             state.bridge_session_id = bridge_sid
                             state.upstream_session_id = upstream_sid
+                        else:
+                            logger.warning("no agent resolved for listening device=%s", device_id)
                 elif (not listening_flag) and state.listening:
                     state.listening = False
+                    state.mic_activity_token += 1
                     if state.mic_chunks:
                         await _process_ptt_stop(device_id)
                 continue
@@ -249,6 +277,7 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                 raw_chunk = _safe_decode_b64(audio_base64)
                 if raw_chunk:
                     state.mic_chunks.append(raw_chunk)
+                    state.mic_activity_token += 1
 
                 if not state.bridge_session_id:
                     agent_id = await _get_device_default_agent(device_id)
@@ -256,6 +285,11 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                         bridge_sid, upstream_sid = await _ensure_agentmanager_session(device_id, agent_id)
                         state.bridge_session_id = bridge_sid
                         state.upstream_session_id = upstream_sid
+                    else:
+                        logger.warning("discarding mic chunk without resolved agent device=%s", device_id)
+
+                if raw_chunk and not state.listening:
+                    asyncio.create_task(_schedule_legacy_stop(device_id, state.mic_activity_token))
 
                 session_id = str(msg.get("session_id", "")) or state.bridge_session_id
                 if session_id:
@@ -278,6 +312,7 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
 
                 bridge_sid, upstream_sid = await _ensure_agentmanager_session(device_id, agent_id)
                 state.listening = True
+                state.mic_activity_token += 1
                 state.mic_chunks.clear()
                 state.bridge_session_id = bridge_sid
                 state.upstream_session_id = upstream_sid
@@ -294,6 +329,7 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
             if mtype == "ptt.stop":
                 state = await runtime.get_device_state(device_id)
                 state.listening = False
+                state.mic_activity_token += 1
                 await _process_ptt_stop(device_id)
                 if state.bridge_session_id:
                     async with get_session_ctx() as db:

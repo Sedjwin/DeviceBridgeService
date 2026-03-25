@@ -142,6 +142,12 @@ async def post_agent_timeline(session_id: str, payload: AgentTimelineIn, db: Asy
     )
 
     commands = mapper.timeline_to_commands(payload.timeline, ctx)
+    await store.add_session_event(
+        db,
+        session_id=session_id,
+        event_type="agent.timeline",
+        payload={"timeline": [event.model_dump() for event in payload.timeline]},
+    )
     await _emit_debug(session_id, "timeline_parse", {"event_count": len(payload.timeline), "command_count": len(commands)})
 
     dispatched: list[str] = []
@@ -167,19 +173,40 @@ async def post_agent_output(session_id: str, payload: AgentOutputIn, db: AsyncSe
 
     await _emit_debug(session_id, "agent_output_start", {"has_audio": payload.audio_base64 is not None})
 
-    timeline_result = await post_agent_timeline(
-        session_id,
-        AgentTimelineIn(timeline=payload.timeline, profile=payload.profile),
-        db,
-    )
-
+    timeline_result: dict | None = None
     audio_result: dict | None = None
-    if payload.audio_base64:
-        audio_result = await post_agent_audio(
+    errors: list[str] = []
+
+    try:
+        timeline_result = await post_agent_timeline(
             session_id,
-            AgentAudioIn(audio_base64=payload.audio_base64),
+            AgentTimelineIn(timeline=payload.timeline, profile=payload.profile),
             db,
         )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"timeline dispatch failed: {exc}")
+        await store.add_session_event(
+            db,
+            session_id=session_id,
+            event_type="dispatch.error",
+            payload={"stage": "timeline", "error": str(exc)},
+        )
+
+    if payload.audio_base64:
+        try:
+            audio_result = await post_agent_audio(
+                session_id,
+                AgentAudioIn(audio_base64=payload.audio_base64),
+                db,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"audio dispatch failed: {exc}")
+            await store.add_session_event(
+                db,
+                session_id=session_id,
+                event_type="dispatch.error",
+                payload={"stage": "audio", "error": str(exc)},
+            )
 
     await store.add_session_event(
         db,
@@ -188,8 +215,8 @@ async def post_agent_output(session_id: str, payload: AgentOutputIn, db: AsyncSe
         payload={"text": payload.text, "timeline_count": len(payload.timeline), "has_audio": payload.audio_base64 is not None},
     )
 
-    await _emit_debug(session_id, "done", {"text": payload.text, "timeline": timeline_result, "audio": audio_result})
-    return {"status": "ok", "timeline": timeline_result, "audio": audio_result}
+    await _emit_debug(session_id, "done", {"text": payload.text, "timeline": timeline_result, "audio": audio_result, "errors": errors})
+    return {"status": "ok" if not errors else "partial", "timeline": timeline_result, "audio": audio_result, "errors": errors}
 
 
 @router.post("/sessions/{session_id}/stop", response_model=SessionStopOut)

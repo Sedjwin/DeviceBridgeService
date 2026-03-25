@@ -15,6 +15,7 @@ class DeviceConversationState:
     listening: bool = False
     sample_rate: int = 16000
     mic_chunks: list[bytes] = field(default_factory=list)
+    mic_activity_token: int = 0
 
 
 class SessionRuntime:
