@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_1944
+// DBS_AVATAR_2026_03_25_2001
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1944";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2001";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -107,6 +107,7 @@ static volatile bool g_streamActive = false;
 static volatile bool g_streamEnded = false;
 static volatile bool g_streamStartedPlayback = false;
 static volatile uint32_t g_streamBytesPlayed = 0;
+static uint32_t g_lastStreamLogMs = 0;
 
 #if LVGL_VERSION_MAJOR >= 9
 static lv_point_precise_t g_poly0[2];
@@ -159,6 +160,7 @@ static void resetStreamState() {
   g_streamEnded = false;
   g_streamStartedPlayback = false;
   g_streamBytesPlayed = 0;
+  g_lastStreamLogMs = 0;
 }
 
 static bool streamBufWrite(const uint8_t *data, size_t len) {
@@ -514,6 +516,10 @@ static void sendDeviceStatus() {
   extra["session_id"] = g_sessionId;
   extra["render_mode"] = renderModeName(g_renderMode);
   extra["audio_playing"] = g_audioPlaying;
+  extra["stream_buffered"] = (uint32_t)streamBufAvailable();
+  extra["stream_target"] = g_streamPrebufferBytes;
+  extra["stream_started"] = g_streamStartedPlayback;
+  extra["stream_played_bytes"] = g_streamBytesPlayed;
   extra["sample_rate"] = g_playbackSampleRate;
   extra["channels"] = g_playbackChannels;
   extra["bits_per_sample"] = g_playbackBitsPerSample;
@@ -1106,7 +1112,7 @@ static void micTask(void *arg) {
 
 static void audioStreamTask(void *arg) {
   (void)arg;
-  static uint8_t outBuf[2048];
+  static uint8_t outBuf[1024];
 
   for (;;) {
     if (!g_streamActive) {
@@ -1115,11 +1121,17 @@ static void audioStreamTask(void *arg) {
     }
 
     size_t buffered = streamBufAvailable();
+    uint32_t now = millis();
     if (!g_streamStartedPlayback) {
       if (buffered >= g_streamPrebufferBytes || (g_streamEnded && buffered > 0)) {
         beginPlayback(g_playbackSampleRate);
         g_streamStartedPlayback = true;
+        sendDeviceLog("info", String("Audio playback start: buffered=") + String(buffered));
       } else {
+        if (now - g_lastStreamLogMs > 1500) {
+          g_lastStreamLogMs = now;
+          sendDeviceLog("info", String("Buffering audio: buffered=") + String(buffered) + " target=" + String(g_streamPrebufferBytes));
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -1129,12 +1141,22 @@ static void audioStreamTask(void *arg) {
     if (got > 0) {
       uint32_t elapsedMs = (uint32_t)(((uint64_t)g_streamBytesPlayed * 1000ULL) / (uint64_t)max(1UL, playbackBytesPerSecond()));
       updateVisemeProgress(elapsedMs);
-      g_audio->I2sAudio_PlayWrite(outBuf, got);
+      int rc = g_audio->I2sAudio_PlayWrite(outBuf, got);
+      if (rc != ESP_CODEC_DEV_OK && now - g_lastStreamLogMs > 500) {
+        g_lastError = String("audio_write_") + String(rc);
+        g_lastStreamLogMs = now;
+        sendDeviceLog("error", String("Audio write failed rc=") + String(rc), g_lastError.c_str());
+      }
       g_streamBytesPlayed += (uint32_t)got;
+      if (now - g_lastStreamLogMs > 1500) {
+        g_lastStreamLogMs = now;
+        sendDeviceLog("info", String("Audio playback progress: buffered=") + String(streamBufAvailable()) + " played=" + String(g_streamBytesPlayed));
+      }
       continue;
     }
 
     if (g_streamEnded) {
+      sendDeviceLog("info", String("Audio playback end: played=") + String(g_streamBytesPlayed));
       endPlayback();
       resetStreamState();
       g_lastError = "";
