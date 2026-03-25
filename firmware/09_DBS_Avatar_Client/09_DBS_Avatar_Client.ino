@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_1932
+// DBS_AVATAR_2026_03_25_1944
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1932";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1944";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -98,7 +98,7 @@ static uint8_t g_playbackBitsPerSample = 16;
 static String g_lastError = "";
 static SemaphoreHandle_t g_audioBufMutex = nullptr;
 static uint8_t *g_streamBuf = nullptr;
-static size_t g_streamBufCap = 131072;
+static size_t g_streamBufCap = 262144;
 static size_t g_streamReadPos = 0;
 static size_t g_streamWritePos = 0;
 static size_t g_streamBuffered = 0;
@@ -430,7 +430,7 @@ static void sendHello() {
   caps["preferred_sample_rate"] = 24000;
   caps["preferred_audio_method"] = "ws_stream";
   caps["max_inline_audio_bytes"] = 262144;
-  caps["stream_prebuffer_ms"] = 1200;
+  caps["stream_prebuffer_ms"] = 1800;
 
   caps["mic_enabled"] = true;
   caps["mic_format"] = "pcm16";
@@ -459,7 +459,7 @@ static void sendHello() {
   audioOut["frame_format"] = "interleaved";
   audioOut["preferred_chunk_bytes"] = 2048;
   audioOut["max_chunk_bytes"] = 4096;
-  audioOut["stream_prebuffer_ms"] = 1200;
+  audioOut["stream_prebuffer_ms"] = 1800;
 
   JsonObject audioIn = caps.createNestedObject("audio_input");
   JsonArray inCodecs = audioIn.createNestedArray("codecs");
@@ -886,8 +886,11 @@ static void updateAvatarFrame() {
     tilt = (int)(sweep * 35.0f);
   }
 
-  int headW = 210 + (activeAnim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
-  int headH = 240 + (activeAnim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
+  float breathe = sinf(g_animTime * 0.75f);
+  int headBreath = (int)(breathe * 4.0f);
+  int headW = 210 + headBreath + (activeAnim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
+  int headH = 240 + headBreath + (activeAnim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
+  int headYOffset = (int)(breathe * 3.0f);
 
   int lx = cx - 55 + tilt / 4;
   int rx = cx + 55 + tilt / 4;
@@ -914,23 +917,23 @@ static void updateAvatarFrame() {
   }
 
   // Wireframe low-poly face (6 line segments)
-  g_poly0[0] = { (lv_coord_t)(cx - headW / 2), (lv_coord_t)(cy - headH / 2) };
-  g_poly0[1] = { (lv_coord_t)(cx + headW / 2), (lv_coord_t)(cy - headH / 2 + tilt) };
+  g_poly0[0] = { (lv_coord_t)(cx - headW / 2), (lv_coord_t)(cy - headH / 2 + headYOffset) };
+  g_poly0[1] = { (lv_coord_t)(cx + headW / 2), (lv_coord_t)(cy - headH / 2 + tilt + headYOffset) };
 
-  g_poly1[0] = { (lv_coord_t)(cx + headW / 2), (lv_coord_t)(cy - headH / 2 + tilt) };
-  g_poly1[1] = { (lv_coord_t)(cx + headW / 2 - 10), (lv_coord_t)(cy + headH / 2) };
+  g_poly1[0] = { (lv_coord_t)(cx + headW / 2), (lv_coord_t)(cy - headH / 2 + tilt + headYOffset) };
+  g_poly1[1] = { (lv_coord_t)(cx + headW / 2 - 10), (lv_coord_t)(cy + headH / 2 + headYOffset) };
 
-  g_poly2[0] = { (lv_coord_t)(cx + headW / 2 - 10), (lv_coord_t)(cy + headH / 2) };
-  g_poly2[1] = { (lv_coord_t)(cx - headW / 2 + 10), (lv_coord_t)(cy + headH / 2 - tilt) };
+  g_poly2[0] = { (lv_coord_t)(cx + headW / 2 - 10), (lv_coord_t)(cy + headH / 2 + headYOffset) };
+  g_poly2[1] = { (lv_coord_t)(cx - headW / 2 + 10), (lv_coord_t)(cy + headH / 2 - tilt + headYOffset) };
 
-  g_poly3[0] = { (lv_coord_t)(cx - headW / 2 + 10), (lv_coord_t)(cy + headH / 2 - tilt) };
-  g_poly3[1] = { (lv_coord_t)(cx - headW / 2), (lv_coord_t)(cy - headH / 2) };
+  g_poly3[0] = { (lv_coord_t)(cx - headW / 2 + 10), (lv_coord_t)(cy + headH / 2 - tilt + headYOffset) };
+  g_poly3[1] = { (lv_coord_t)(cx - headW / 2), (lv_coord_t)(cy - headH / 2 + headYOffset) };
 
-  g_poly4[0] = { (lv_coord_t)(cx - headW / 2), (lv_coord_t)(cy) };
-  g_poly4[1] = { (lv_coord_t)(cx + headW / 2), (lv_coord_t)(cy + tilt / 2) };
+  g_poly4[0] = { (lv_coord_t)(cx - headW / 2), (lv_coord_t)(cy + headYOffset) };
+  g_poly4[1] = { (lv_coord_t)(cx + headW / 2), (lv_coord_t)(cy + tilt / 2 + headYOffset) };
 
-  g_poly5[0] = { (lv_coord_t)(cx), (lv_coord_t)(cy - headH / 2 + 10) };
-  g_poly5[1] = { (lv_coord_t)(cx), (lv_coord_t)(cy + headH / 2 - 10) };
+  g_poly5[0] = { (lv_coord_t)(cx), (lv_coord_t)(cy - headH / 2 + 10 + headYOffset) };
+  g_poly5[1] = { (lv_coord_t)(cx), (lv_coord_t)(cy + headH / 2 - 10 + headYOffset) };
 
   lv_line_set_points(g_wireLines[0], g_poly0, 2);
   lv_line_set_points(g_wireLines[1], g_poly1, 2);
@@ -939,14 +942,14 @@ static void updateAvatarFrame() {
   lv_line_set_points(g_wireLines[4], g_poly4, 2);
   lv_line_set_points(g_wireLines[5], g_poly5, 2);
 
-  lv_obj_set_pos(g_facePanel, cx - headW / 2, cy - headH / 2);
+  lv_obj_set_pos(g_facePanel, cx - headW / 2, cy - headH / 2 + headYOffset);
   lv_obj_set_size(g_facePanel, headW, headH);
-  lv_obj_set_pos(g_eyeL, lx - 10, ey - eyeH / 2);
+  lv_obj_set_pos(g_eyeL, lx - 10, ey - eyeH / 2 + headYOffset);
   lv_obj_set_size(g_eyeL, 20, eyeH);
-  lv_obj_set_pos(g_eyeR, rx - 10, ey - eyeH / 2);
+  lv_obj_set_pos(g_eyeR, rx - 10, ey - eyeH / 2 + headYOffset);
   lv_obj_set_size(g_eyeR, 20, eyeH);
 
-  lv_obj_set_pos(g_mouth, cx - mouthW / 2 + tilt / 6, cy + 55);
+  lv_obj_set_pos(g_mouth, cx - mouthW / 2 + tilt / 6, cy + 55 + headYOffset);
   lv_obj_set_size(g_mouth, mouthW, mouthH);
 
   if (g_renderMode == RENDER_LINE) {
@@ -1103,7 +1106,7 @@ static void micTask(void *arg) {
 
 static void audioStreamTask(void *arg) {
   (void)arg;
-  static uint8_t outBuf[1024];
+  static uint8_t outBuf[2048];
 
   for (;;) {
     if (!g_streamActive) {
@@ -1145,7 +1148,7 @@ static void audioStreamTask(void *arg) {
 static void initAvatarUi() {
   g_root = lv_obj_create(lv_scr_act());
   lv_obj_set_size(g_root, LCD_H_RES, LCD_V_RES);
-  lv_obj_set_style_bg_color(g_root, lv_color_hex(0x05070C), 0);
+  lv_obj_set_style_bg_color(g_root, lv_color_hex(0x000000), 0);
   lv_obj_set_style_border_width(g_root, 0, 0);
   lv_obj_set_style_pad_all(g_root, 0, 0);
 
