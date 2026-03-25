@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_2202
+// DBS_AVATAR_2026_03_25_2212
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2202";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2212";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -139,7 +139,8 @@ static lv_point_t g_poly5[2];
 // ====== Utils ======
 static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode = nullptr);
 static bool wsQueuePush(const String &payload);
-static bool wsQueuePop(String &payload);
+static bool wsQueuePeek(String &payload);
+static bool wsQueueDropFront();
 static void wsQueueClear();
 static void wsFlushQueuedMessages();
 
@@ -161,7 +162,7 @@ static bool wsQueuePush(const String &payload) {
   return true;
 }
 
-static bool wsQueuePop(String &payload) {
+static bool wsQueuePeek(String &payload) {
   if (!g_wsQueueMutex) {
     return false;
   }
@@ -173,6 +174,21 @@ static bool wsQueuePop(String &payload) {
     return false;
   }
   payload = g_wsTxQueue[g_wsTxHead];
+  xSemaphoreGive(g_wsQueueMutex);
+  return true;
+}
+
+static bool wsQueueDropFront() {
+  if (!g_wsQueueMutex) {
+    return false;
+  }
+  if (!xSemaphoreTake(g_wsQueueMutex, pdMS_TO_TICKS(20))) {
+    return false;
+  }
+  if (g_wsTxCount == 0) {
+    xSemaphoreGive(g_wsQueueMutex);
+    return false;
+  }
   g_wsTxQueue[g_wsTxHead] = "";
   g_wsTxHead = (g_wsTxHead + 1U) % WS_TX_QUEUE_CAP;
   g_wsTxCount--;
@@ -212,19 +228,18 @@ static void wsFlushQueuedMessages() {
   }
   for (int i = 0; i < 8; ++i) {
     String payload;
-    if (!wsQueuePop(payload)) {
+    if (!wsQueuePeek(payload)) {
       break;
     }
     if (!xSemaphoreTake(g_wsMutex, pdMS_TO_TICKS(50))) {
-      wsQueuePush(payload);
       break;
     }
     bool ok = g_ws.sendTXT(payload);
     xSemaphoreGive(g_wsMutex);
     if (!ok) {
-      wsQueuePush(payload);
       break;
     }
+    wsQueueDropFront();
   }
 }
 
@@ -1447,7 +1462,7 @@ void loop() {
   wsFlushQueuedMessages();
 
   uint32_t now = millis();
-  if (g_wsConnected && now - g_lastStatusMs > 5000) {
+  if (g_wsConnected && g_helloAcked && now - g_lastStatusMs > 5000) {
     g_lastStatusMs = now;
     sendDeviceStatus();
   }
