@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from app.db import get_session_ctx, init_db
 from app.models import Device
-from app.routers import devices, health, sessions
+from app.routers import admin, devices, health, sessions
 from app.schemas import DeviceAck, DeviceHello, DeviceStatus
 from app.services import store
 from app.services.device_hub import hub
@@ -24,6 +24,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="DeviceBridgeService", version="0.1.0", lifespan=lifespan)
 app.include_router(health.router)
+app.include_router(admin.router)
 app.include_router(devices.router)
 app.include_router(sessions.router)
 

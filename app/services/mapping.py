@@ -68,3 +68,40 @@ class MappingEngine:
                 }
             )
         return commands
+
+
+def _normalize_name(value: str) -> str:
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def suggest_rule_for_label(
+    label: str,
+    animations: list[str],
+    *,
+    preferred_render_mode: str,
+    supported_modes: list[str],
+) -> MappingRule:
+    normalized_label = _normalize_name(label)
+    normalized_animations = {_normalize_name(name): name for name in animations}
+
+    if normalized_label in normalized_animations:
+        target = normalized_animations[normalized_label]
+    else:
+        target = ""
+        for norm, original in normalized_animations.items():
+            if normalized_label in norm or norm in normalized_label:
+                target = original
+                break
+        if not target:
+            for candidate in ("neutral_blink", "idle", DEFAULT_FALLBACK):
+                if candidate in animations:
+                    target = candidate
+                    break
+        if not target and animations:
+            target = animations[0]
+        if not target:
+            target = DEFAULT_FALLBACK
+
+    render_mode = preferred_render_mode if preferred_render_mode in supported_modes else None
+    fallback = [DEFAULT_FALLBACK] if target != DEFAULT_FALLBACK else []
+    return MappingRule(animation=target, render_mode=render_mode, fallback=fallback)

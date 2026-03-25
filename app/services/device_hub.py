@@ -37,6 +37,7 @@ class DeviceHub:
         for future in conn.pending_acks.values():
             if not future.done():
                 future.set_exception(TimeoutError("Device disconnected before ACK"))
+        await conn.websocket.close(code=1001)
 
     def is_online(self, device_id: str) -> bool:
         return device_id in self._connections
@@ -85,6 +86,12 @@ class DeviceHub:
                 fut.set_result({"ok": True})
             else:
                 fut.set_exception(RuntimeError(error or "Device NACK"))
+
+    async def force_disconnect(self, device_id: str) -> bool:
+        if device_id not in self._connections:
+            return False
+        await self.disconnect(device_id)
+        return True
 
 
 hub = DeviceHub()

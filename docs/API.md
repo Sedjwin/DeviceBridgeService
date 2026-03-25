@@ -5,6 +5,7 @@ External URL (via Caddy): `https://<host>:13382`
 
 ## Health
 - `GET /health`
+- `GET /admin` (admin UI)
 
 ## Device Management
 - `GET /api/devices`
@@ -20,6 +21,12 @@ External URL (via Caddy): `https://<host>:13382`
 - `POST /api/sessions/{session_id}/stop`
 - `GET /api/sessions/{session_id}/debug` (SSE)
 - `GET /api/sessions/{session_id}/mic`
+
+## Admin APIs
+- `GET /api/admin/agents`
+- `POST /api/admin/mappings/suggest`
+- `POST /api/admin/devices/{device_id}/disconnect`
+- `GET /api/admin/mappings/preview/{device_id}/{agent_id}`
 
 ## WebSocket (device-facing)
 - `WS /ws/device/{device_id}`

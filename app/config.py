@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./data/devicebridge.db"
 
+    agentmanager_url: str = "http://localhost:8003"
     usermanager_url: str = "http://localhost:8005"
     usermanager_service_key: str = "change-me-service-key"
     require_auth: bool = False

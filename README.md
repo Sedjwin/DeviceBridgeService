@@ -18,6 +18,7 @@ It receives agent outputs (timeline + audio), translates per-agent emotion/actio
 - Debug SSE stream and mic uplink polling endpoint
 - WebSocket device control channel with ACK/NACK command confirmation
 - Telemetry ingestion (`device.status`) and session event audit log
+- Built-in admin page at `/admin` for device and mapping operations
 
 ## Agent personalization support
 The service consumes AgentManager-compatible concepts:
@@ -75,6 +76,7 @@ DeviceBridgeService/
 See [docs/API.md](docs/API.md) for complete list.
 
 - `GET /health`
+- `GET /admin`
 - `GET /api/devices`
 - `PUT /api/devices/{device_id}/capabilities`
 - `PUT /api/devices/{device_id}/mappings`
@@ -87,6 +89,9 @@ See [docs/API.md](docs/API.md) for complete list.
 - `GET /api/sessions/{session_id}/debug`
 - `GET /api/sessions/{session_id}/mic`
 - `WS /ws/device/{device_id}`
+- `GET /api/admin/agents`
+- `POST /api/admin/mappings/suggest`
+- `POST /api/admin/devices/{device_id}/disconnect`
 
 ## ESP32 Protocol
 
@@ -144,6 +149,15 @@ Example pattern:
 4. Post AgentManager timeline/audio output to `/agent-output`.
 5. Service translates to device commands and waits for ACKs.
 6. Device sends `mic.chunk`; integration layer reads `/api/sessions/{id}/mic` and forwards to AgentManager/AIGateway voice path.
+
+## Admin Workflow
+
+1. Open `/admin`.
+2. Add or update a device capability manifest (animations, render modes).
+3. Select an agent brain from AgentManager.
+4. Generate suggested emotion/action mapping from agent profile to device animations.
+5. Review/edit JSON mapping and save.
+6. Use per-device disconnect control for operational recovery.
 
 ## Testing
 

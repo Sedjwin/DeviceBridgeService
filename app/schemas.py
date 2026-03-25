@@ -139,3 +139,25 @@ class DeviceCommand(BaseModel):
     command_id: str
     type: str
     payload: dict[str, Any]
+
+
+class AgentSummary(BaseModel):
+    agent_id: str
+    name: str
+    profile: dict[str, Any] | None = None
+    voice_enabled: bool = False
+    voice_config: dict[str, Any] | None = None
+
+
+class MappingSuggestIn(BaseModel):
+    agent_id: str
+    device_id: str
+    preferred_render_mode: str | None = None
+
+
+class MappingSuggestOut(BaseModel):
+    agent_id: str
+    device_id: str
+    preferred_render_mode: str
+    emotion_map: dict[str, MappingRule]
+    action_map: dict[str, MappingRule]
