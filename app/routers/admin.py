@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -149,6 +150,14 @@ def _session_files(session_id: str) -> list[dict[str, Any]]:
     return files
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 @router.get("/admin", response_class=HTMLResponse)
 async def admin_page() -> str:
     return """<!doctype html>
@@ -232,6 +241,7 @@ async def admin_page() -> str:
         <a class="link" href="/openapi.json" target="_blank">OpenAPI</a>
         <button class="primary" onclick="refreshAll()">Refresh</button>
         <button class="bad" onclick="cleanupFakeDevices()">Delete Fake Devices</button>
+        <button class="bad" onclick="pruneStaleDevices()">Prune Offline Stale</button>
       </div>
     </div>
 
@@ -311,6 +321,7 @@ async def admin_page() -> str:
           <select id="sessionSelect"></select>
           <button onclick="loadSessionArtifacts()">Load Session</button>
           <button onclick="disconnectSelected()" class="bad">Disconnect Device</button>
+          <button onclick="deleteSelectedDevice()" class="bad">Delete Device Record</button>
         </div>
         <div id="sessionSummary" class="muted">No session selected.</div>
         <div id="filesLinks" class="files scroll"></div>
@@ -534,6 +545,36 @@ async function cleanupFakeDevices(){
   await refreshAll(false);
 }
 
+async function deleteSelectedDevice(){
+  if(!selectedDeviceId){ return; }
+  const device = dashboard.devices.find(d => d.device_id === selectedDeviceId);
+  if(!device || device.online){
+    alert('Only offline device records can be deleted.');
+    return;
+  }
+  if(!confirm(`Delete stale device record ${selectedDeviceId}?`)){ return; }
+  await fetch(`/api/admin/devices/${encodeURIComponent(selectedDeviceId)}/delete`, {method:'POST'});
+  selectedDeviceId = '';
+  selectedSessionId = '';
+  await refreshAll(false);
+}
+
+async function pruneStaleDevices(){
+  const hours = prompt('Delete offline devices unseen for at least how many hours?', '24');
+  if(!hours){ return; }
+  const value = Number(hours);
+  if(!Number.isFinite(value) || value < 0){
+    alert('Enter a valid number of hours.');
+    return;
+  }
+  const res = await fetch(`/api/admin/devices/prune-stale?older_than_hours=${encodeURIComponent(String(value))}`, {method:'POST'});
+  const data = await res.json();
+  alert(`Removed ${data.removed.length} device record(s).`);
+  selectedDeviceId = '';
+  selectedSessionId = '';
+  await refreshAll(false);
+}
+
 refreshAll(false);
 setInterval(() => refreshAll(true).catch(()=>{}), 5000);
 </script>
@@ -689,6 +730,41 @@ async def cleanup_fake_devices(db: AsyncSession = Depends(get_db)) -> dict[str, 
         shutil.rmtree(DATA_ROOT / row.device_id, ignore_errors=True)
         removed.append(row.device_id)
     return {"status": "ok", "removed": removed}
+
+
+@router.post("/api/admin/devices/{device_id}/delete")
+async def delete_device_record(device_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    row = await db.get(Device, device_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="device not found")
+    if hub.is_online(device_id):
+        raise HTTPException(status_code=409, detail="cannot delete online device")
+    deleted = await store.delete_device(db, device_id=device_id)
+    shutil.rmtree(DATA_ROOT / device_id, ignore_errors=True)
+    return {"status": "ok", "deleted": deleted, "device_id": device_id}
+
+
+@router.post("/api/admin/devices/prune-stale")
+async def prune_stale_devices(older_than_hours: int = 24, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    cutoff = datetime.now(UTC) - timedelta(hours=max(0, older_than_hours))
+    rows = await store.list_devices(db)
+    removed: list[str] = []
+    for row in rows:
+        if _is_fake_device(row.device_id, row.name, row.model):
+            continue
+        if hub.is_online(row.device_id):
+            continue
+        telemetry = await _latest_telemetry(db, row.device_id)
+        updated_at = _as_utc(row.updated_at)
+        last_seen = _as_utc(telemetry.created_at if telemetry is not None else None)
+        if telemetry is None and updated_at is not None and updated_at >= cutoff:
+            continue
+        if last_seen is not None and last_seen >= cutoff:
+            continue
+        await store.delete_device(db, device_id=row.device_id)
+        shutil.rmtree(DATA_ROOT / row.device_id, ignore_errors=True)
+        removed.append(row.device_id)
+    return {"status": "ok", "removed": removed, "older_than_hours": older_than_hours}
 
 
 @router.post("/api/admin/devices/{device_id}/disconnect")
