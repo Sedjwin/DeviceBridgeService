@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_2001
+// DBS_AVATAR_2026_03_25_2022
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2001";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2022";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -40,6 +40,7 @@ String g_sessionId = "";
 uint32_t g_lastStatusMs = 0;
 uint32_t g_lastFrameMs = 0;
 float g_animTime = 0.0f;
+uint32_t g_wsDisconnectCount = 0;
 
 // ====== Avatar UI ======
 static lv_obj_t *g_root = nullptr;
@@ -108,6 +109,9 @@ static volatile bool g_streamEnded = false;
 static volatile bool g_streamStartedPlayback = false;
 static volatile uint32_t g_streamBytesPlayed = 0;
 static uint32_t g_lastStreamLogMs = 0;
+static volatile uint32_t g_streamBytesReceived = 0;
+static volatile uint32_t g_streamChunkCount = 0;
+static String g_streamPhase = "idle";
 
 #if LVGL_VERSION_MAJOR >= 9
 static lv_point_precise_t g_poly0[2];
@@ -161,6 +165,9 @@ static void resetStreamState() {
   g_streamStartedPlayback = false;
   g_streamBytesPlayed = 0;
   g_lastStreamLogMs = 0;
+  g_streamBytesReceived = 0;
+  g_streamChunkCount = 0;
+  g_streamPhase = "idle";
 }
 
 static bool streamBufWrite(const uint8_t *data, size_t len) {
@@ -380,6 +387,7 @@ static void startListening() {
   setOutputFormat(24000, 2, 16);
   g_anim = AVATAR_LISTEN;
   setStatus("Listening... release to stop");
+  sendPhaseLog("info", "ptt_listening", "PTT start");
   StaticJsonDocument<256> start;
   start["type"] = "ptt.start";
   start["agent_id"] = DEFAULT_AGENT_ID;
@@ -391,6 +399,7 @@ static void stopListening() {
   g_listenStarted = false;
   g_anim = AVATAR_IDLE;
   setStatus("Ready");
+  sendPhaseLog("info", "ptt_release", "PTT stop");
   StaticJsonDocument<256> stop;
   stop["type"] = "ptt.stop";
   stop["session_id"] = g_sessionId;
@@ -487,6 +496,7 @@ static void sendHello() {
   imageOut["color_depth"] = 16;
 
   wsSendJson(doc);
+  sendPhaseLog("info", "hello_sent", "Capability manifest sent");
 }
 
 static void sendAck(const char *commandId, bool ok, const char *errorMsg = nullptr) {
@@ -501,7 +511,7 @@ static void sendAck(const char *commandId, bool ok, const char *errorMsg = nullp
 }
 
 static void sendDeviceStatus() {
-  StaticJsonDocument<256> st;
+  StaticJsonDocument<512> st;
   st["type"] = "device.status";
   st["fps"] = 30.0;
   float bufferLevel = 0.0f;
@@ -516,13 +526,17 @@ static void sendDeviceStatus() {
   extra["session_id"] = g_sessionId;
   extra["render_mode"] = renderModeName(g_renderMode);
   extra["audio_playing"] = g_audioPlaying;
+  extra["stream_phase"] = g_streamPhase;
   extra["stream_buffered"] = (uint32_t)streamBufAvailable();
   extra["stream_target"] = g_streamPrebufferBytes;
   extra["stream_started"] = g_streamStartedPlayback;
   extra["stream_played_bytes"] = g_streamBytesPlayed;
+  extra["stream_received_bytes"] = g_streamBytesReceived;
+  extra["stream_chunks"] = g_streamChunkCount;
   extra["sample_rate"] = g_playbackSampleRate;
   extra["channels"] = g_playbackChannels;
   extra["bits_per_sample"] = g_playbackBitsPerSample;
+  extra["ws_disconnects"] = g_wsDisconnectCount;
   if (g_lastError.length() > 0) {
     extra["last_error"] = g_lastError;
   }
@@ -530,7 +544,7 @@ static void sendDeviceStatus() {
 }
 
 static void sendDeviceLog(const char *level, const String &message, const char *errorCode = nullptr) {
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<640> doc;
   doc["type"] = "device.log";
   doc["level"] = level ? level : "info";
   doc["message"] = message;
@@ -538,6 +552,17 @@ static void sendDeviceLog(const char *level, const String &message, const char *
   JsonObject extra = doc.createNestedObject("extra");
   extra["render_mode"] = renderModeName(g_renderMode);
   extra["audio_playing"] = g_audioPlaying;
+  extra["stream_phase"] = g_streamPhase;
+  extra["stream_buffered"] = (uint32_t)streamBufAvailable();
+  extra["stream_target"] = g_streamPrebufferBytes;
+  extra["stream_started"] = g_streamStartedPlayback;
+  extra["stream_played_bytes"] = g_streamBytesPlayed;
+  extra["stream_received_bytes"] = g_streamBytesReceived;
+  extra["stream_chunks"] = g_streamChunkCount;
+  extra["sample_rate"] = g_playbackSampleRate;
+  extra["channels"] = g_playbackChannels;
+  extra["bits_per_sample"] = g_playbackBitsPerSample;
+  extra["ws_disconnects"] = g_wsDisconnectCount;
   if (errorCode && strlen(errorCode) > 0) {
     extra["error_code"] = errorCode;
   } else if (g_lastError.length() > 0) {
@@ -548,6 +573,11 @@ static void sendDeviceLog(const char *level, const String &message, const char *
   Serial.print(level ? level : "info");
   Serial.print("] ");
   Serial.println(message);
+}
+
+static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode = nullptr) {
+  g_streamPhase = String(phase ? phase : "unknown");
+  sendDeviceLog(level, message, errorCode);
 }
 
 static String resolveAudioUrl(const char *url, const char *path) {
@@ -725,12 +755,15 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
       g_wsConnected = false;
+      g_wsDisconnectCount++;
       setStatus("DBS disconnected");
+      sendPhaseLog("error", "ws_disconnected", "WebSocket disconnected", "ws_disconnected");
       break;
 
     case WStype_CONNECTED:
       g_wsConnected = true;
       setStatus("DBS connected");
+      sendPhaseLog("info", "ws_connected", "WebSocket connected");
       sendHello();
       break;
 
@@ -744,11 +777,13 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       const char *msgType = doc["type"] | "";
       if (strcmp(msgType, "hello.ack") == 0) {
         setStatus("Device registered");
+        sendPhaseLog("info", "registered", "Device hello acknowledged");
         return;
       }
       if (strcmp(msgType, "ptt.ready") == 0) {
         g_sessionId = String((const char *)(doc["session_id"] | ""));
         setStatus("Listening... release to stop");
+        sendPhaseLog("info", "ptt_ready", String("PTT ready session=") + g_sessionId);
         return;
       }
 
@@ -811,12 +846,14 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         g_streamEnded = false;
         setStatus("Buffering voice...");
         g_lastError = "";
+        sendPhaseLog("info", "audio_stream_start", String("Audio stream start target=") + String(g_streamPrebufferBytes));
         sendAck(commandId, true);
         return;
       }
 
       if (strcmp(msgType, "audio.stream.end") == 0) {
         g_streamEnded = true;
+        sendPhaseLog("info", "audio_stream_end", "Audio stream end received");
         sendAck(commandId, true);
         return;
       }
@@ -858,9 +895,13 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       if (!g_streamActive || length == 0) {
         return;
       }
+      g_streamBytesReceived += (uint32_t)length;
+      g_streamChunkCount += 1;
       if (!streamBufWrite(payload, length)) {
         g_lastError = "audio_stream_overflow";
-        sendDeviceLog("error", "Audio stream buffer overflow", g_lastError.c_str());
+        sendPhaseLog("error", "audio_stream_overflow", "Audio stream buffer overflow", g_lastError.c_str());
+      } else if ((g_streamChunkCount % 32U) == 0U) {
+        sendPhaseLog("info", "audio_stream_buffering", String("Audio binary chunks=") + String(g_streamChunkCount));
       }
       return;
     }
@@ -1126,11 +1167,11 @@ static void audioStreamTask(void *arg) {
       if (buffered >= g_streamPrebufferBytes || (g_streamEnded && buffered > 0)) {
         beginPlayback(g_playbackSampleRate);
         g_streamStartedPlayback = true;
-        sendDeviceLog("info", String("Audio playback start: buffered=") + String(buffered));
+        sendPhaseLog("info", "audio_playback_start", String("Audio playback start: buffered=") + String(buffered));
       } else {
         if (now - g_lastStreamLogMs > 1500) {
           g_lastStreamLogMs = now;
-          sendDeviceLog("info", String("Buffering audio: buffered=") + String(buffered) + " target=" + String(g_streamPrebufferBytes));
+          sendPhaseLog("info", "audio_buffering", String("Buffering audio: buffered=") + String(buffered) + " target=" + String(g_streamPrebufferBytes));
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
@@ -1145,18 +1186,18 @@ static void audioStreamTask(void *arg) {
       if (rc != ESP_CODEC_DEV_OK && now - g_lastStreamLogMs > 500) {
         g_lastError = String("audio_write_") + String(rc);
         g_lastStreamLogMs = now;
-        sendDeviceLog("error", String("Audio write failed rc=") + String(rc), g_lastError.c_str());
+        sendPhaseLog("error", "audio_write_error", String("Audio write failed rc=") + String(rc), g_lastError.c_str());
       }
       g_streamBytesPlayed += (uint32_t)got;
       if (now - g_lastStreamLogMs > 1500) {
         g_lastStreamLogMs = now;
-        sendDeviceLog("info", String("Audio playback progress: buffered=") + String(streamBufAvailable()) + " played=" + String(g_streamBytesPlayed));
+        sendPhaseLog("info", "audio_playback_progress", String("Audio playback progress: buffered=") + String(streamBufAvailable()) + " played=" + String(g_streamBytesPlayed));
       }
       continue;
     }
 
     if (g_streamEnded) {
-      sendDeviceLog("info", String("Audio playback end: played=") + String(g_streamBytesPlayed));
+      sendPhaseLog("info", "audio_playback_end", String("Audio playback end: played=") + String(g_streamBytesPlayed));
       endPlayback();
       resetStreamState();
       g_lastError = "";
