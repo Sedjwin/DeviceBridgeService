@@ -8,6 +8,7 @@ import io
 import struct
 import wave
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -49,8 +50,9 @@ def _materialize_audio_output(device_id: str, session_id: str, audio_base64: str
 
 
 def _choose_sample_rate(caps: dict, source_rate: int | None) -> int | None:
-    supported = [int(x) for x in caps.get("sample_rates", []) if int(x) > 0]
-    preferred = caps.get("preferred_sample_rate")
+    audio_out = caps.get("audio_output", {}) if isinstance(caps.get("audio_output"), dict) else {}
+    supported = [int(x) for x in audio_out.get("sample_rates", caps.get("sample_rates", [])) if int(x) > 0]
+    preferred = audio_out.get("preferred_sample_rate", caps.get("preferred_sample_rate"))
     if preferred is not None:
         try:
             preferred_i = int(preferred)
@@ -65,6 +67,64 @@ def _choose_sample_rate(caps: dict, source_rate: int | None) -> int | None:
     if supported:
         return supported[0]
     return source_rate
+
+
+def _choose_audio_methods(caps: dict) -> list[str]:
+    audio_out = caps.get("audio_output", {}) if isinstance(caps.get("audio_output"), dict) else {}
+    methods = audio_out.get("transport_methods", caps.get("audio_methods", []))
+    out = [str(x).strip().lower() for x in methods if str(x).strip()]
+    return out or ["inline", "url", "ws_stream"]
+
+
+def _choose_audio_codec(caps: dict) -> str:
+    audio_out = caps.get("audio_output", {}) if isinstance(caps.get("audio_output"), dict) else {}
+    preferred = str(audio_out.get("preferred_codec", "") or "").strip().lower()
+    if preferred:
+        return preferred
+    codecs = [str(x).strip().lower() for x in audio_out.get("codecs", caps.get("audio_codecs", [])) if str(x).strip()]
+    return codecs[0] if codecs else "wav"
+
+
+def _choose_audio_channels(caps: dict) -> int:
+    audio_out = caps.get("audio_output", {}) if isinstance(caps.get("audio_output"), dict) else {}
+    preferred = audio_out.get("preferred_channels")
+    if preferred is not None:
+        try:
+            preferred_i = int(preferred)
+            if preferred_i > 0:
+                return preferred_i
+        except (TypeError, ValueError):
+            pass
+    supported = audio_out.get("channels_supported", [])
+    for value in supported:
+        try:
+            candidate = int(value)
+            if candidate > 0:
+                return candidate
+        except (TypeError, ValueError):
+            continue
+    return 1
+
+
+def _choose_bits_per_sample(caps: dict) -> int:
+    audio_out = caps.get("audio_output", {}) if isinstance(caps.get("audio_output"), dict) else {}
+    preferred = audio_out.get("preferred_bits_per_sample")
+    if preferred is not None:
+        try:
+            preferred_i = int(preferred)
+            if preferred_i > 0:
+                return preferred_i
+        except (TypeError, ValueError):
+            pass
+    supported = audio_out.get("bits_per_sample_supported", [])
+    for value in supported:
+        try:
+            candidate = int(value)
+            if candidate > 0:
+                return candidate
+        except (TypeError, ValueError):
+            continue
+    return 16
 
 
 def _wav_resample(audio_bytes: bytes, target_rate: int | None) -> tuple[bytes, int | None]:
@@ -108,18 +168,36 @@ def _wav_resample(audio_bytes: bytes, target_rate: int | None) -> tuple[bytes, i
         return audio_bytes, None
 
 
-def _wav_to_pcm(audio_bytes: bytes) -> tuple[bytes, int | None]:
+def _wav_to_pcm(audio_bytes: bytes) -> tuple[bytes, int | None, int | None, int | None]:
     try:
         with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
             channels = wf.getnchannels()
             sampwidth = wf.getsampwidth()
             source_rate = wf.getframerate()
             frames = wf.readframes(wf.getnframes())
-        if channels != 1 or sampwidth != 2:
-            return b"", source_rate
-        return frames, source_rate
+        return frames, source_rate, channels, sampwidth * 8
     except Exception:
-        return b"", None
+        return b"", None, None, None
+
+
+def _pcm_mono_to_stereo(pcm_bytes: bytes) -> bytes:
+    if not pcm_bytes:
+        return b""
+    samples = struct.unpack(f"<{len(pcm_bytes) // 2}h", pcm_bytes)
+    stereo: list[int] = []
+    for sample in samples:
+        stereo.extend((sample, sample))
+    return struct.pack(f"<{len(stereo)}h", *stereo)
+
+
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int, channels: int, bits_per_sample: int) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(bits_per_sample // 8)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return out.getvalue()
 
 
 def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sample_rate: int | None) -> dict:
@@ -127,27 +205,41 @@ def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sa
     audio_bytes = base64.b64decode(audio_base64)
     target_rate = _choose_sample_rate(caps, sample_rate)
     adapted_bytes, adapted_rate = _wav_resample(audio_bytes, target_rate)
+    pcm_bytes, pcm_rate, pcm_channels, pcm_bits = _wav_to_pcm(adapted_bytes)
+    target_channels = _choose_audio_channels(caps)
+    target_bits = _choose_bits_per_sample(caps)
+    if pcm_bits != 16:
+        target_bits = pcm_bits or target_bits
+    if pcm_channels == 1 and target_channels == 2 and pcm_bytes:
+        pcm_bytes = _pcm_mono_to_stereo(pcm_bytes)
+    elif pcm_channels and pcm_channels != target_channels:
+        target_channels = pcm_channels
+    elif not pcm_channels:
+        target_channels = max(1, target_channels)
+    if pcm_bytes and (pcm_rate or adapted_rate):
+        adapted_bytes = _pcm_to_wav(pcm_bytes, int(pcm_rate or adapted_rate or 16000), target_channels, target_bits)
     adapted_b64 = base64.b64encode(adapted_bytes).decode("ascii")
     audio_path, audio_size = _materialize_audio_output(device.device_id, session_id, adapted_b64)
-    pcm_bytes, pcm_rate = _wav_to_pcm(adapted_bytes)
 
-    methods = [str(x).strip().lower() for x in caps.get("audio_methods", []) if str(x).strip()]
-    if not methods:
-        methods = ["inline", "url", "ws_stream"]
-    preferred_method = str(caps.get("preferred_audio_method", "") or "").strip().lower()
+    methods = _choose_audio_methods(caps)
+    audio_out = caps.get("audio_output", {}) if isinstance(caps.get("audio_output"), dict) else {}
+    preferred_method = str(audio_out.get("preferred_transport", caps.get("preferred_audio_method", "")) or "").strip().lower()
+    preferred_codec = _choose_audio_codec(caps)
     max_inline_audio_bytes = caps.get("max_inline_audio_bytes")
     try:
         inline_limit = int(max_inline_audio_bytes) if max_inline_audio_bytes is not None else settings.device_inline_audio_max_bytes
     except (TypeError, ValueError):
         inline_limit = settings.device_inline_audio_max_bytes
 
-    if "ws_stream" in methods and pcm_bytes and preferred_method in {"ws_stream", "stream", ""}:
+    if "ws_stream" in methods and pcm_bytes and preferred_codec == "pcm_s16le" and preferred_method in {"ws_stream", "stream", "ws_binary", ""}:
         return {
             "command_type": "audio.stream",
             "sample_rate": pcm_rate or adapted_rate or sample_rate,
             "audio_size": len(pcm_bytes),
             "audio_path": audio_path,
             "pcm_bytes": pcm_bytes,
+            "channels": target_channels,
+            "bits_per_sample": target_bits,
             "prebuffer_ms": int(caps.get("stream_prebuffer_ms") or 1200),
             "chunk_bytes": 2048,
         }
@@ -162,6 +254,8 @@ def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sa
                 "session_id": session_id,
                 "audio_base64": adapted_b64,
                 "sample_rate": adapted_rate or sample_rate,
+                "channels": target_channels,
+                "bits_per_sample": target_bits,
             },
             "audio_size": audio_size,
             "audio_path": audio_path,
@@ -175,6 +269,8 @@ def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sa
             "url": f"{settings.public_base_url.rstrip('/')}{relative_path}",
             "path": relative_path,
             "sample_rate": adapted_rate or sample_rate,
+            "channels": target_channels,
+            "bits_per_sample": target_bits,
             "content_type": "audio/wav",
             "bytes": audio_size,
             "prebuffer_ms": caps.get("stream_prebuffer_ms"),
@@ -254,9 +350,11 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
         pcm_bytes = prepared["pcm_bytes"]
         chunk_bytes = int(prepared.get("chunk_bytes") or 4096)
         sample_rate_out = int(prepared.get("sample_rate") or payload.sample_rate or 16000)
+        channels_out = int(prepared.get("channels") or 1)
+        bits_out = int(prepared.get("bits_per_sample") or 16)
         prebuffer_ms = int(prepared.get("prebuffer_ms") or 250)
         total_chunks = max(1, (len(pcm_bytes) + chunk_bytes - 1) // chunk_bytes)
-        bytes_per_second = max(1, sample_rate_out * 2)
+        bytes_per_second = max(1, sample_rate_out * channels_out * max(1, bits_out // 8))
         prebuffer_bytes = max(chunk_bytes, int(bytes_per_second * (prebuffer_ms / 1000.0)))
         stream_id = await hub.dispatch_command(
             row.device_id,
@@ -264,8 +362,9 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
             {
                 "session_id": session_id,
                 "sample_rate": sample_rate_out,
-                "channels": 1,
+                "channels": channels_out,
                 "format": "pcm_s16le",
+                "bits_per_sample": bits_out,
                 "bytes": len(pcm_bytes),
                 "chunk_bytes": chunk_bytes,
                 "prebuffer_ms": prebuffer_ms,

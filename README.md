@@ -110,12 +110,13 @@ Handshake:
 Commands are issued with `command_id`; device must return `ack` or `nack`.
 
 Audio return path:
-- Device advertises `audio_methods`, `sample_rates`, `preferred_sample_rate`, and optional `max_inline_audio_bytes`
-- DBS chooses the reply transport per device from that manifest
-- DBS resamples returned WAV audio to the nearest supported device rate before dispatch
+- Device advertises legacy audio fields plus structured `audio_output` / `audio_input` contracts
+- DBS chooses the reply transport, codec, sample rate, channel count, and bit depth from that manifest
+- DBS adapts returned audio before dispatch, including resampling and mono->stereo expansion when required by the device
 - Current methods:
   - `inline`: `audio.play`
   - `url`: `audio.play_url`
+  - `ws_stream`: `audio.stream.start` + binary websocket PCM frames + `audio.stream.end`
 
 ## Running Locally
 
@@ -163,7 +164,7 @@ Example pattern:
 4. DBS creates/uses an AgentManager session, forwards WAV audio, receives agent response.
 5. DBS translates timeline and dispatches avatar/audio commands back to device.
 6. DBS negotiates audio transport/rate from device capabilities and adapts returned audio accordingly.
-7. Large TTS replies can be materialized under `audio_out/` and served back to the device via URL.
+7. DBS can adapt long-form TTS into device-declared websocket PCM streams or served WAV artifacts, depending on transport policy.
 8. DBS stores input/output artifacts under `data/devices/{device_id}/sessions/{bridge_session_id}/`.
 
 ## Admin Workflow
@@ -202,8 +203,9 @@ Included tests:
 - Setup notes: [firmware/09_DBS_Avatar_Client/README.md](firmware/09_DBS_Avatar_Client/README.md)
 - Current sketch features:
   - hold-to-talk PTT
-  - large-audio playback via `audio.play_url`
-  - viseme timeline payload support
+  - device-declared media contract (`audio_output`, `audio_input`, render/image metadata)
+  - binary websocket PCM playback (`ws_stream`)
+  - viseme timeline payload support with playback-clock timing
   - idle blink/tilt/scan behavior
   - swipe left/right render-mode cycling (`line`, `shape`, `cartoon`, `model3d`)
 

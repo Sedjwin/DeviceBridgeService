@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_1904
+// DBS_AVATAR_2026_03_25_1932
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1904";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1932";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -93,6 +93,8 @@ static volatile uint32_t g_touchStartMs = 0;
 static uint32_t g_animHoldUntilMs = 0;
 static uint32_t g_nextIdleAnimMs = 0;
 static uint32_t g_playbackSampleRate = 16000;
+static uint8_t g_playbackChannels = 2;
+static uint8_t g_playbackBitsPerSample = 16;
 static String g_lastError = "";
 static SemaphoreHandle_t g_audioBufMutex = nullptr;
 static uint8_t *g_streamBuf = nullptr;
@@ -332,16 +334,28 @@ static void updateVisemeProgress(uint32_t elapsedMs) {
   g_activeViseme = g_visemes[g_visemeIndex].value;
 }
 
-static void setOutputSampleRate(uint32_t sampleRate) {
+static uint32_t playbackBytesPerSecond() {
+  return (uint32_t)g_playbackSampleRate * (uint32_t)g_playbackChannels * ((uint32_t)g_playbackBitsPerSample / 8U);
+}
+
+static void setOutputFormat(uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample) {
   if (sampleRate < 8000 || sampleRate > 48000) {
-    sampleRate = 16000;
+    sampleRate = 24000;
+  }
+  if (channels < 1 || channels > 2) {
+    channels = 2;
+  }
+  if (bitsPerSample != 16) {
+    bitsPerSample = 16;
   }
   g_playbackSampleRate = sampleRate;
-  g_audio->I2sAudio_SetCodecInfo("mic&spk", 1, sampleRate, 2, 16);
+  g_playbackChannels = channels;
+  g_playbackBitsPerSample = bitsPerSample;
+  g_audio->I2sAudio_SetCodecInfo("mic&spk", 1, sampleRate, channels, bitsPerSample);
+  Serial.printf("Audio out format: %lu Hz, %u ch, %u-bit\n", (unsigned long)sampleRate, channels, bitsPerSample);
 }
 
 static void beginPlayback(uint32_t sampleRate) {
-  setOutputSampleRate(sampleRate);
   g_audioPlaying = true;
   g_visemeIndex = 0;
   g_activeViseme = 0;
@@ -352,7 +366,7 @@ static void endPlayback() {
   g_audioPlaying = false;
   clearVisemes();
   g_anim = AVATAR_IDLE;
-  setOutputSampleRate(16000);
+  setOutputFormat(24000, 2, 16);
   setStatus("Ready");
   g_streamStartedPlayback = false;
 }
@@ -361,7 +375,7 @@ static void startListening() {
   g_listening = true;
   g_listenStarted = true;
   clearVisemes();
-  setOutputSampleRate(16000);
+  setOutputFormat(24000, 2, 16);
   g_anim = AVATAR_LISTEN;
   setStatus("Listening... release to stop");
   StaticJsonDocument<256> start;
@@ -413,7 +427,7 @@ static void sendHello() {
   sampleRates.add(16000);
   sampleRates.add(22050);
   sampleRates.add(24000);
-  caps["preferred_sample_rate"] = 22050;
+  caps["preferred_sample_rate"] = 24000;
   caps["preferred_audio_method"] = "ws_stream";
   caps["max_inline_audio_bytes"] = 262144;
   caps["stream_prebuffer_ms"] = 1200;
@@ -421,6 +435,54 @@ static void sendHello() {
   caps["mic_enabled"] = true;
   caps["mic_format"] = "pcm16";
   caps["color_themes"] = true;
+  JsonObject audioOut = caps.createNestedObject("audio_output");
+  JsonArray outMethods = audioOut.createNestedArray("transport_methods");
+  outMethods.add("ws_stream");
+  outMethods.add("inline");
+  outMethods.add("url");
+  JsonArray outCodecs = audioOut.createNestedArray("codecs");
+  outCodecs.add("pcm_s16le");
+  outCodecs.add("wav");
+  JsonArray outRates = audioOut.createNestedArray("sample_rates");
+  outRates.add(16000);
+  outRates.add(22050);
+  outRates.add(24000);
+  JsonArray outChannels = audioOut.createNestedArray("channels_supported");
+  outChannels.add(2);
+  JsonArray outBits = audioOut.createNestedArray("bits_per_sample_supported");
+  outBits.add(16);
+  audioOut["preferred_transport"] = "ws_stream";
+  audioOut["preferred_codec"] = "pcm_s16le";
+  audioOut["preferred_sample_rate"] = 24000;
+  audioOut["preferred_channels"] = 2;
+  audioOut["preferred_bits_per_sample"] = 16;
+  audioOut["frame_format"] = "interleaved";
+  audioOut["preferred_chunk_bytes"] = 2048;
+  audioOut["max_chunk_bytes"] = 4096;
+  audioOut["stream_prebuffer_ms"] = 1200;
+
+  JsonObject audioIn = caps.createNestedObject("audio_input");
+  JsonArray inCodecs = audioIn.createNestedArray("codecs");
+  inCodecs.add("pcm_s16le");
+  JsonArray inRates = audioIn.createNestedArray("sample_rates");
+  inRates.add(16000);
+  JsonArray inChannels = audioIn.createNestedArray("channels_supported");
+  inChannels.add(1);
+  JsonArray inBits = audioIn.createNestedArray("bits_per_sample_supported");
+  inBits.add(16);
+  audioIn["preferred_codec"] = "pcm_s16le";
+  audioIn["preferred_sample_rate"] = 16000;
+  audioIn["preferred_channels"] = 1;
+  audioIn["preferred_bits_per_sample"] = 16;
+
+  JsonObject imageOut = caps.createNestedObject("image_output");
+  JsonArray imageFormats = imageOut.createNestedArray("formats");
+  imageFormats.add("line");
+  imageFormats.add("shape");
+  imageFormats.add("cartoon");
+  imageFormats.add("model3d");
+  imageOut["preferred_format"] = "line";
+  imageOut["color_depth"] = 16;
 
   wsSendJson(doc);
 }
@@ -452,6 +514,9 @@ static void sendDeviceStatus() {
   extra["session_id"] = g_sessionId;
   extra["render_mode"] = renderModeName(g_renderMode);
   extra["audio_playing"] = g_audioPlaying;
+  extra["sample_rate"] = g_playbackSampleRate;
+  extra["channels"] = g_playbackChannels;
+  extra["bits_per_sample"] = g_playbackBitsPerSample;
   if (g_lastError.length() > 0) {
     extra["last_error"] = g_lastError;
   }
@@ -539,7 +604,7 @@ static void playPcmBuffer(const uint8_t *data, size_t len) {
   beginPlayback(g_playbackSampleRate);
   while (cursor < len) {
     size_t n = (len - cursor > chunk) ? chunk : (len - cursor);
-    uint32_t elapsedMs = (uint32_t)(((uint64_t)cursor * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+    uint32_t elapsedMs = (uint32_t)(((uint64_t)cursor * 1000ULL) / (uint64_t)max(1UL, playbackBytesPerSecond()));
     updateVisemeProgress(elapsedMs);
     g_audio->I2sAudio_PlayWrite((uint8_t *)(data + cursor), n);
     cursor += n;
@@ -547,19 +612,19 @@ static void playPcmBuffer(const uint8_t *data, size_t len) {
   endPlayback();
 }
 
-static bool playAudioBase64(const char *audioB64, uint32_t sampleRate) {
+static bool playAudioBase64(const char *audioB64, uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample) {
   uint8_t *pcm = nullptr;
   size_t pcmLen = 0;
   if (!base64Decode(audioB64, &pcm, &pcmLen)) {
     return false;
   }
-  setOutputSampleRate(sampleRate);
+  setOutputFormat(sampleRate, channels, bitsPerSample);
   playPcmBuffer(pcm, pcmLen);
   free(pcm);
   return true;
 }
 
-static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
+static bool playAudioFromUrl(const char *url, uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample) {
   if (!url || strlen(url) == 0 || WiFi.status() != WL_CONNECTED) {
     g_lastError = "audio_url_invalid";
     return false;
@@ -590,7 +655,7 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
     return false;
   }
   setStatus("Fetching voice...");
-  setOutputSampleRate(sampleRate);
+  setOutputFormat(sampleRate, channels, bitsPerSample);
 
   WiFiClient *stream = http.getStreamPtr();
   static uint8_t streamBuf[1024];
@@ -631,7 +696,7 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
     size_t start = skip;
     skip = 0;
     if (start < (size_t)got) {
-      uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+      uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (uint64_t)max(1UL, playbackBytesPerSecond()));
       updateVisemeProgress(elapsedMs);
       g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
       bytesPlayed += ((size_t)got - start);
@@ -704,12 +769,14 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         const char *sessionId = doc["payload"]["session_id"] | "";
         const char *audioB64 = doc["payload"]["audio_base64"] | "";
         uint32_t sampleRate = (uint32_t)(doc["payload"]["sample_rate"] | 16000);
+        uint8_t channels = (uint8_t)(doc["payload"]["channels"] | 2);
+        uint8_t bitsPerSample = (uint8_t)(doc["payload"]["bits_per_sample"] | 16);
         g_sessionId = String(sessionId);
 
         if (strlen(audioB64) > 0) {
           loadVisemes(doc["payload"]["visemes"]);
           sendAck(commandId, true);
-          playAudioBase64(audioB64, sampleRate);
+          playAudioBase64(audioB64, sampleRate, channels, bitsPerSample);
         } else {
           sendAck(commandId, false, "empty audio payload");
         }
@@ -719,12 +786,14 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       if (strcmp(msgType, "audio.stream.start") == 0) {
         const char *sessionId = doc["payload"]["session_id"] | "";
         uint32_t sampleRate = (uint32_t)(doc["payload"]["sample_rate"] | 16000);
+        uint8_t channels = (uint8_t)(doc["payload"]["channels"] | 2);
+        uint8_t bitsPerSample = (uint8_t)(doc["payload"]["bits_per_sample"] | 16);
         uint32_t prebufferMs = (uint32_t)(doc["payload"]["prebuffer_ms"] | 250);
         g_sessionId = String(sessionId);
         loadVisemes(doc["payload"]["visemes"]);
         resetStreamState();
-        setOutputSampleRate(sampleRate);
-        uint32_t wanted = (uint32_t)(((uint64_t)g_playbackSampleRate * 2ULL * (uint64_t)prebufferMs) / 1000ULL);
+        setOutputFormat(sampleRate, channels, bitsPerSample);
+        uint32_t wanted = (uint32_t)(((uint64_t)playbackBytesPerSecond() * (uint64_t)prebufferMs) / 1000ULL);
         if (wanted < 4096) {
           wanted = 4096;
         }
@@ -751,13 +820,15 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         const char *url = doc["payload"]["url"] | "";
         const char *path = doc["payload"]["path"] | "";
         uint32_t sampleRate = (uint32_t)(doc["payload"]["sample_rate"] | 16000);
+        uint8_t channels = (uint8_t)(doc["payload"]["channels"] | 2);
+        uint8_t bitsPerSample = (uint8_t)(doc["payload"]["bits_per_sample"] | 16);
         g_sessionId = String(sessionId);
 
         String resolvedUrl = resolveAudioUrl(url, path);
         if (resolvedUrl.length() > 0) {
           loadVisemes(doc["payload"]["visemes"]);
           sendAck(commandId, true);
-          if (!playAudioFromUrl(resolvedUrl.c_str(), sampleRate)) {
+          if (!playAudioFromUrl(resolvedUrl.c_str(), sampleRate, channels, bitsPerSample)) {
             setStatus("Audio fetch failed");
             sendDeviceLog("error", String("Audio fetch failed: ") + g_lastError, g_lastError.c_str());
             sendDeviceStatus();
@@ -1053,7 +1124,7 @@ static void audioStreamTask(void *arg) {
 
     size_t got = streamBufRead(outBuf, sizeof(outBuf));
     if (got > 0) {
-      uint32_t elapsedMs = (uint32_t)(((uint64_t)g_streamBytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+      uint32_t elapsedMs = (uint32_t)(((uint64_t)g_streamBytesPlayed * 1000ULL) / (uint64_t)max(1UL, playbackBytesPerSecond()));
       updateVisemeProgress(elapsedMs);
       g_audio->I2sAudio_PlayWrite(outBuf, got);
       g_streamBytesPlayed += (uint32_t)got;
@@ -1176,7 +1247,7 @@ void setup() {
   g_audio = new I2sAudioCodec("S3_AMOLED_1_32");
   g_audio->I2sAudio_SetMicGain(20);
   g_audio->I2sAudio_SetSpeakerVol(85);
-  g_audio->I2sAudio_SetCodecInfo("mic&spk", 1, 16000, 2, 16);
+  g_audio->I2sAudio_SetCodecInfo("mic&spk", 1, 24000, 2, 16);
 
   Lvgl_PortInit();
   if (lvgl_lock(0)) {

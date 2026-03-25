@@ -21,6 +21,9 @@ class DeviceCapabilities(BaseModel):
     mic_format: str = "pcm16"
     accepts_model_directives: bool = False
     default_agent_id: str = ""
+    audio_output: dict[str, Any] = Field(default_factory=dict)
+    audio_input: dict[str, Any] = Field(default_factory=dict)
+    image_output: dict[str, Any] = Field(default_factory=dict)
 
 
 class DeviceUpsert(BaseModel):
