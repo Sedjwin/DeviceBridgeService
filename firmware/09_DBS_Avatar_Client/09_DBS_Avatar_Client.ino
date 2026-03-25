@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_1819
+// DBS_AVATAR_2026_03_25_1836
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1819";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1836";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -375,6 +375,27 @@ static void sendDeviceStatus() {
   wsSendJson(st);
 }
 
+static void sendDeviceLog(const char *level, const String &message, const char *errorCode = nullptr) {
+  StaticJsonDocument<384> doc;
+  doc["type"] = "device.log";
+  doc["level"] = level ? level : "info";
+  doc["message"] = message;
+  doc["session_id"] = g_sessionId;
+  JsonObject extra = doc.createNestedObject("extra");
+  extra["render_mode"] = renderModeName(g_renderMode);
+  extra["audio_playing"] = g_audioPlaying;
+  if (errorCode && strlen(errorCode) > 0) {
+    extra["error_code"] = errorCode;
+  } else if (g_lastError.length() > 0) {
+    extra["error_code"] = g_lastError;
+  }
+  wsSendJson(doc);
+  Serial.print("[");
+  Serial.print(level ? level : "info");
+  Serial.print("] ");
+  Serial.println(message);
+}
+
 static String resolveAudioUrl(const char *url, const char *path) {
   if (!path || strlen(path) == 0) {
     if (url && strlen(url) > 0) {
@@ -457,6 +478,7 @@ static bool playAudioBase64(const char *audioB64, uint32_t sampleRate) {
 
 static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   if (!url || strlen(url) == 0 || WiFi.status() != WL_CONNECTED) {
+    g_lastError = "audio_url_invalid";
     return false;
   }
 
@@ -468,16 +490,19 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   if (strncmp(url, "https://", 8) == 0) {
     secureClient.setInsecure();
     if (!http.begin(secureClient, url)) {
+      g_lastError = "http_begin_failed_https";
       return false;
     }
   } else {
     if (!http.begin(plainClient, url)) {
+      g_lastError = "http_begin_failed_http";
       return false;
     }
   }
 
   int status = http.GET();
   if (status != HTTP_CODE_OK) {
+    g_lastError = String("http_status_") + String(status);
     http.end();
     return false;
   }
@@ -485,79 +510,59 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   setOutputSampleRate(sampleRate);
 
   WiFiClient *stream = http.getStreamPtr();
-  int total = http.getSize();
-  uint8_t *buffer = nullptr;
-  if (total > 0) {
-    buffer = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buffer) {
-      buffer = (uint8_t *)malloc(total);
-    }
-  }
-
-  if (buffer && total > 0) {
-    size_t readBytes = 0;
-    while (http.connected() && readBytes < (size_t)total) {
-      size_t avail = stream->available();
-      if (!avail) {
-        delay(2);
-        continue;
-      }
-      int got = stream->readBytes(buffer + readBytes, avail);
-      if (got <= 0) {
+  static uint8_t streamBuf[1024];
+  bool firstChunk = true;
+  uint8_t headerBuf[96];
+  size_t headerLen = 0;
+  size_t skip = 0;
+  size_t bytesPlayed = 0;
+  uint32_t idleLoops = 0;
+  beginPlayback(g_playbackSampleRate);
+  while (http.connected()) {
+    size_t avail = stream->available();
+    if (!avail) {
+      idleLoops++;
+      if (idleLoops > 3000) {
+        g_lastError = "audio_stream_timeout";
         break;
       }
-      readBytes += (size_t)got;
+      delay(2);
+      continue;
     }
-    if (readBytes > 0) {
-      playPcmBuffer(buffer, readBytes);
+    idleLoops = 0;
+    int got = stream->readBytes(streamBuf, min(avail, sizeof(streamBuf)));
+    if (got <= 0) {
+      g_lastError = "audio_stream_read_failed";
+      break;
+    }
+    if (firstChunk) {
+      size_t copyLen = (size_t)got < sizeof(headerBuf) ? (size_t)got : sizeof(headerBuf);
+      memcpy(headerBuf, streamBuf, copyLen);
+      headerLen = copyLen;
+      skip = wavPayloadOffset(headerBuf, headerLen);
+      firstChunk = false;
+      if (skip >= (size_t)got) {
+        continue;
+      }
+    }
+    size_t start = skip;
+    skip = 0;
+    if (start < (size_t)got) {
+      uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+      updateVisemeProgress(elapsedMs);
+      g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
+      bytesPlayed += ((size_t)got - start);
       ok = true;
     }
-    free(buffer);
-  } else {
-    static uint8_t streamBuf[1024];
-    bool firstChunk = true;
-    uint8_t headerBuf[96];
-    size_t headerLen = 0;
-    size_t skip = 0;
-    size_t bytesPlayed = 0;
-    beginPlayback(g_playbackSampleRate);
-    while (http.connected()) {
-      size_t avail = stream->available();
-      if (!avail) {
-        if (!http.connected()) {
-          break;
-        }
-        delay(2);
-        continue;
-      }
-      int got = stream->readBytes(streamBuf, min(avail, sizeof(streamBuf)));
-      if (got <= 0) {
-        break;
-      }
-      if (firstChunk) {
-        size_t copyLen = (size_t)got < sizeof(headerBuf) ? (size_t)got : sizeof(headerBuf);
-        memcpy(headerBuf, streamBuf, copyLen);
-        headerLen = copyLen;
-        skip = wavPayloadOffset(headerBuf, headerLen);
-        firstChunk = false;
-        if (skip >= (size_t)got) {
-          continue;
-        }
-      }
-      size_t start = skip;
-      skip = 0;
-      if (start < (size_t)got) {
-        uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
-        updateVisemeProgress(elapsedMs);
-        g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
-        bytesPlayed += ((size_t)got - start);
-        ok = true;
-      }
-    }
-    endPlayback();
   }
+  endPlayback();
 
   http.end();
+  if (ok) {
+    g_lastError = "";
+  } else if (g_lastError.length() == 0) {
+    g_lastError = "audio_stream_empty";
+  }
   return ok;
 }
 
@@ -640,8 +645,8 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
           loadVisemes(doc["payload"]["visemes"]);
           sendAck(commandId, true);
           if (!playAudioFromUrl(resolvedUrl.c_str(), sampleRate)) {
-            g_lastError = "audio_fetch_failed";
             setStatus("Audio fetch failed");
+            sendDeviceLog("error", String("Audio fetch failed: ") + g_lastError, g_lastError.c_str());
             sendDeviceStatus();
           } else {
             g_lastError = "";

@@ -17,7 +17,7 @@ from app.config import settings
 from app.db import get_session_ctx, init_db
 from app.models import BridgeSession, Device
 from app.routers import admin, devices, health, sessions
-from app.schemas import DeviceAck, DeviceHello, DeviceStatus
+from app.schemas import DeviceAck, DeviceHello, DeviceLog, DeviceStatus
 from app.services import store
 from app.services.device_hub import hub
 from app.services.runtime import runtime
@@ -300,6 +300,34 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                     state.mic_activity_token += 1
                     if state.mic_chunks:
                         await _process_ptt_stop(device_id)
+                continue
+
+            if mtype == "device.log":
+                log_msg = DeviceLog.model_validate(msg)
+                session_id = str(log_msg.session_id or "").strip()
+                if not session_id:
+                    state = await runtime.get_device_state(device_id)
+                    session_id = state.bridge_session_id or ""
+                if session_id:
+                    async with get_session_ctx() as db:
+                        await store.add_session_event(
+                            db,
+                            session_id=session_id,
+                            event_type="device.log",
+                            payload={
+                                "level": log_msg.level,
+                                "message": log_msg.message,
+                                "extra": log_msg.extra,
+                            },
+                        )
+                logger.info(
+                    "device log device=%s level=%s session=%s msg=%s extra=%s",
+                    device_id,
+                    log_msg.level,
+                    session_id,
+                    log_msg.message,
+                    log_msg.extra,
+                )
                 continue
 
             if mtype == "mic.chunk":

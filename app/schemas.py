@@ -144,6 +144,14 @@ class DeviceMicChunk(BaseModel):
     sample_rate: int = 16000
 
 
+class DeviceLog(BaseModel):
+    type: Literal["device.log"]
+    level: str = "info"
+    message: str
+    session_id: str = ""
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
 class DeviceCommand(BaseModel):
     command_id: str
     type: str
