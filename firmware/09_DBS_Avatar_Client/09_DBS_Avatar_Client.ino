@@ -577,7 +577,7 @@ static void sendDeviceLog(const char *level, const String &message, const char *
   Serial.println(message);
 }
 
-static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode = nullptr) {
+static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode) {
   g_streamPhase = String(phase ? phase : "unknown");
   sendDeviceLog(level, message, errorCode);
 }
