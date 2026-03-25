@@ -75,6 +75,7 @@ DeviceBridgeService/
 
 See [docs/API.md](docs/API.md) for complete list.
 
+- `GET /` (quick links panel)
 - `GET /health`
 - `GET /admin`
 - `GET /api/devices`
@@ -92,6 +93,9 @@ See [docs/API.md](docs/API.md) for complete list.
 - `GET /api/admin/agents`
 - `POST /api/admin/mappings/suggest`
 - `POST /api/admin/devices/{device_id}/disconnect`
+- `GET /api/admin/devices/{device_id}/sessions`
+- `GET /api/admin/sessions/{session_id}/events`
+- `GET /api/admin/sessions/{session_id}/files`
 
 ## ESP32 Protocol
 

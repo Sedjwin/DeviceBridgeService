@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -69,6 +70,12 @@ async def admin_page() -> str:
 <body>
 <div class=\"wrap\">
   <h1>DeviceBridgeService Admin</h1>
+  <div class=\"row\">
+    <a href=\"/\" style=\"color:#7fd6ff\">Home</a>
+    <a href=\"/health\" style=\"color:#7fd6ff\">Health</a>
+    <a href=\"/docs\" style=\"color:#7fd6ff\">API Docs</a>
+    <a href=\"/openapi.json\" style=\"color:#7fd6ff\">OpenAPI JSON</a>
+  </div>
   <div class=\"status\" id=\"status\">Ready</div>
 
   <div class=\"grid\">
@@ -114,6 +121,18 @@ async def admin_page() -> str:
       <p>5) If device supports all model directives, mapping can be near-identity.</p>
       <p>6) Audio and mic paths are coordinated through session endpoints.</p>
     </section>
+
+    <section class=\"panel\">
+      <h2>Session Logs</h2>
+      <div class=\"row\">
+        <select id=\"sessionSelect\"></select>
+        <button onclick=\"refreshSessions()\" class=\"primary\">Refresh Sessions</button>
+        <button onclick=\"loadSessionEvents()\">Load Events</button>
+        <button onclick=\"loadSessionFiles()\">Load Files</button>
+      </div>
+      <textarea id=\"eventsJson\" placeholder=\"Session events...\"></textarea>
+      <textarea id=\"filesJson\" placeholder=\"Session files...\"></textarea>
+    </section>
   </div>
 </div>
 <script>
@@ -141,7 +160,7 @@ async function refreshAgents(){
 }
 
 async function refreshAll(){
-  try { await Promise.all([refreshDevices(), refreshAgents()]); setStatus('Refreshed', 'ok'); }
+  try { await Promise.all([refreshDevices(), refreshAgents()]); await refreshSessions(); setStatus('Refreshed', 'ok'); }
   catch(e){ setStatus('Refresh failed: '+e, 'danger'); }
 }
 
@@ -165,12 +184,12 @@ async function saveDevice(){
   };
   const res=await fetch(`/api/devices/${device_id}/capabilities`, {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
   if(!res.ok){setStatus('Save device failed', 'danger'); return;}
-  await refreshDevices(); setStatus('Device saved', 'ok');
+  await refreshDevices(); await refreshSessions(); setStatus('Device saved', 'ok');
 }
 
 async function forceDisconnect(deviceId){
   const res=await fetch(`/api/admin/devices/${deviceId}/disconnect`, {method:'POST'});
-  if(res.ok){setStatus(`Disconnected ${deviceId}`, 'ok'); await refreshDevices();}
+  if(res.ok){setStatus(`Disconnected ${deviceId}`, 'ok'); await refreshDevices(); await refreshSessions();}
   else setStatus(`Disconnect failed for ${deviceId}`, 'danger');
 }
 
@@ -227,6 +246,38 @@ async function toggleSim(){
   sim.onclose=()=>{sim=null; btn.textContent='Connect Simulator'; refreshDevices();};
 }
 
+async function refreshSessions(){
+  const deviceId=document.getElementById('deviceSelect').value;
+  if(!deviceId){return;}
+  const res = await fetch(`/api/admin/devices/${deviceId}/sessions?limit=40`);
+  if(!res.ok){return;}
+  const data = await res.json();
+  const sel = document.getElementById('sessionSelect');
+  sel.innerHTML='';
+  data.forEach(s=>{
+    const o=document.createElement('option');
+    o.value=s.session_id;
+    o.textContent=`${s.session_id} ${s.active?'(active)':'(closed)'}`;
+    sel.appendChild(o);
+  });
+}
+
+async function loadSessionEvents(){
+  const sid=document.getElementById('sessionSelect').value;
+  if(!sid){setStatus('No session selected', 'warn'); return;}
+  const res=await fetch(`/api/admin/sessions/${sid}/events?limit=300`);
+  const data=await res.json();
+  document.getElementById('eventsJson').value=JSON.stringify(data, null, 2);
+}
+
+async function loadSessionFiles(){
+  const sid=document.getElementById('sessionSelect').value;
+  if(!sid){setStatus('No session selected', 'warn'); return;}
+  const res=await fetch(`/api/admin/sessions/${sid}/files`);
+  const data=await res.json();
+  document.getElementById('filesJson').value=JSON.stringify(data, null, 2);
+}
+
 refreshAll();
 </script>
 </body>
@@ -265,6 +316,63 @@ async def disconnect_device(device_id: str, db: AsyncSession = Depends(get_db)) 
         row.online = False
         await db.commit()
     return {"status": "ok", "disconnected": disconnected}
+
+
+@router.get("/api/admin/devices/{device_id}/sessions")
+async def list_device_sessions(device_id: str, limit: int = 100, db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = await store.list_bridge_sessions(db, device_id=device_id, limit=limit)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "session_id": row.session_id,
+                "device_id": row.device_id,
+                "agent_id": row.agent_id,
+                "upstream_session_id": row.upstream_session_id,
+                "active": row.active,
+                "started_at": row.started_at.isoformat() if row.started_at else None,
+                "ended_at": row.ended_at.isoformat() if row.ended_at else None,
+            }
+        )
+    return out
+
+
+@router.get("/api/admin/sessions/{session_id}/events")
+async def list_session_events(session_id: str, limit: int = 400, db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = await store.list_session_events(db, session_id=session_id, limit=limit)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "id": row.id,
+                "session_id": row.session_id,
+                "event_type": row.event_type,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "payload": store.parse_event_payload(row.payload_json),
+            }
+        )
+    return out
+
+
+@router.get("/api/admin/sessions/{session_id}/files")
+async def list_session_files(session_id: str) -> dict[str, Any]:
+    root = Path("data/devices")
+    if not root.exists():
+        return {"session_id": session_id, "files": []}
+
+    files: list[dict[str, Any]] = []
+    for path in root.glob(f"*/sessions/{session_id}/**/*"):
+        if not path.is_file():
+            continue
+        files.append(
+            {
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "modified_at": path.stat().st_mtime,
+            }
+        )
+    files.sort(key=lambda x: x["path"])
+    return {"session_id": session_id, "files": files}
 
 
 @router.post("/api/admin/mappings/suggest", response_model=MappingSuggestOut)

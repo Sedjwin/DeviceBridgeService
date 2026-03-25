@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 from app.config import settings
 from app.db import get_session_ctx, init_db
@@ -34,6 +35,37 @@ app.include_router(health.router)
 app.include_router(admin.router)
 app.include_router(devices.router)
 app.include_router(sessions.router)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root_index() -> str:
+    return """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DeviceBridgeService</title>
+  <style>
+    body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d131a;color:#d7e3ef;margin:0}
+    .wrap{max-width:900px;margin:0 auto;padding:24px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    a.card{display:block;padding:14px;border-radius:10px;border:1px solid #243548;background:#101a24;color:#9ed8ff;text-decoration:none}
+    p{color:#9cb0c3}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>DeviceBridgeService</h1>
+    <p>Quick access panel</p>
+    <div class="grid">
+      <a class="card" href="/admin">Admin UI</a>
+      <a class="card" href="/health">Health</a>
+      <a class="card" href="/docs">Swagger Docs</a>
+      <a class="card" href="/openapi.json">OpenAPI JSON</a>
+    </div>
+  </div>
+</body>
+</html>"""
 
 DATA_ROOT = Path("data/devices")
 

@@ -128,6 +128,19 @@ async def get_bridge_session(session: AsyncSession, *, session_id: str) -> Bridg
     return await session.get(BridgeSession, session_id)
 
 
+async def list_bridge_sessions(
+    session: AsyncSession,
+    *,
+    device_id: str | None = None,
+    limit: int = 100,
+) -> list[BridgeSession]:
+    stmt = select(BridgeSession).order_by(BridgeSession.started_at.desc()).limit(limit)
+    if device_id:
+        stmt = stmt.where(BridgeSession.device_id == device_id)
+    rows = await session.execute(stmt)
+    return list(rows.scalars().all())
+
+
 async def add_session_event(session: AsyncSession, *, session_id: str, event_type: str, payload: dict) -> SessionEvent:
     row = SessionEvent(session_id=session_id, event_type=event_type, payload_json=_json_dumps(payload))
     session.add(row)

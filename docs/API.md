@@ -4,6 +4,7 @@ Internal service URL: `http://localhost:8011`
 External URL (via Caddy): `https://<host>:13382`
 
 ## Health
+- `GET /` (quick links landing page)
 - `GET /health`
 - `GET /admin` (admin UI)
 
@@ -27,6 +28,9 @@ External URL (via Caddy): `https://<host>:13382`
 - `POST /api/admin/mappings/suggest`
 - `POST /api/admin/devices/{device_id}/disconnect`
 - `GET /api/admin/mappings/preview/{device_id}/{agent_id}`
+- `GET /api/admin/devices/{device_id}/sessions`
+- `GET /api/admin/sessions/{session_id}/events`
+- `GET /api/admin/sessions/{session_id}/files`
 
 ## WebSocket (device-facing)
 - `WS /ws/device/{device_id}`
