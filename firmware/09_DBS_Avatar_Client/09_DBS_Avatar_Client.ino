@@ -112,6 +112,7 @@ static uint32_t g_lastStreamLogMs = 0;
 static volatile uint32_t g_streamBytesReceived = 0;
 static volatile uint32_t g_streamChunkCount = 0;
 static String g_streamPhase = "idle";
+static volatile bool g_helloAcked = false;
 
 #if LVGL_VERSION_MAJOR >= 9
 static lv_point_precise_t g_poly0[2];
@@ -498,7 +499,8 @@ static void sendHello() {
   imageOut["color_depth"] = 16;
 
   wsSendJson(doc);
-  sendPhaseLog("info", "hello_sent", "Capability manifest sent");
+  g_streamPhase = "hello_sent";
+  Serial.println("[info] Capability manifest sent");
 }
 
 static void sendAck(const char *commandId, bool ok, const char *errorMsg = nullptr) {
@@ -579,6 +581,13 @@ static void sendDeviceLog(const char *level, const String &message, const char *
 
 static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode) {
   g_streamPhase = String(phase ? phase : "unknown");
+  if (!g_helloAcked && g_streamPhase != "hello_sent") {
+    Serial.print("[");
+    Serial.print(level ? level : "info");
+    Serial.print("] ");
+    Serial.println(message);
+    return;
+  }
   sendDeviceLog(level, message, errorCode);
 }
 
@@ -757,6 +766,7 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
       g_wsConnected = false;
+      g_helloAcked = false;
       g_wsDisconnectCount++;
       setStatus("DBS disconnected");
       sendPhaseLog("error", "ws_disconnected", "WebSocket disconnected", "ws_disconnected");
@@ -778,6 +788,7 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
 
       const char *msgType = doc["type"] | "";
       if (strcmp(msgType, "hello.ack") == 0) {
+        g_helloAcked = true;
         setStatus("Device registered");
         sendPhaseLog("info", "registered", "Device hello acknowledged");
         return;
