@@ -18,7 +18,7 @@ It receives agent outputs (timeline + audio), translates per-agent emotion/actio
 - Debug SSE stream and mic uplink polling endpoint
 - WebSocket device control channel with ACK/NACK command confirmation
 - Telemetry ingestion (`device.status`) and session event audit log
-- Built-in admin page at `/admin` for device and mapping operations
+- Built-in dashboard at `/` and `/admin` for device, routing, transcript, and artifact operations
 
 ## Agent personalization support
 The service consumes AgentManager-compatible concepts:
@@ -75,7 +75,7 @@ DeviceBridgeService/
 
 See [docs/API.md](docs/API.md) for complete list.
 
-- `GET /` (quick links panel)
+- `GET /` (dashboard)
 - `GET /health`
 - `GET /admin`
 - `GET /api/devices`
@@ -96,6 +96,7 @@ See [docs/API.md](docs/API.md) for complete list.
 - `GET /api/admin/devices/{device_id}/sessions`
 - `GET /api/admin/sessions/{session_id}/events`
 - `GET /api/admin/sessions/{session_id}/files`
+- `GET /api/device/sessions/{session_id}/audio/{filename}`
 
 ## ESP32 Protocol
 
@@ -107,6 +108,10 @@ Handshake:
 3. Service replies `hello.ack`
 
 Commands are issued with `command_id`; device must return `ack` or `nack`.
+
+Audio return path:
+- Small replies can be sent inline as `audio.play`
+- Large replies are sent as `audio.play_url` so the device fetches WAV over HTTP instead of receiving multi-megabyte websocket payloads
 
 ## Running Locally
 
@@ -153,16 +158,18 @@ Example pattern:
 3. Device sends `ptt.start`, streams `mic.chunk` while held, then sends `ptt.stop` on release.
 4. DBS creates/uses an AgentManager session, forwards WAV audio, receives agent response.
 5. DBS translates timeline and dispatches avatar/audio commands back to device.
-6. DBS stores input/output artifacts under `data/devices/{device_id}/sessions/{bridge_session_id}/`.
+6. Large TTS replies are materialized under `audio_out/` and served back to the device via URL.
+7. DBS stores input/output artifacts under `data/devices/{device_id}/sessions/{bridge_session_id}/`.
 
 ## Admin Workflow
 
-1. Open `/admin`.
+1. Open `/`.
 2. Add or update a device capability manifest (animations, render modes).
 3. Select an agent brain from AgentManager.
 4. Generate suggested emotion/action mapping from agent profile to device animations.
 5. Review/edit JSON mapping and save.
-6. Use per-device disconnect control for operational recovery.
+6. Inspect session transcript, events, and downloadable `audio_in` / `audio_out` artifacts.
+7. Use per-device disconnect control for operational recovery.
 
 ## Mapping Resolution
 
@@ -181,6 +188,8 @@ pytest -q
 Included tests:
 - Mapping fallback logic
 - WebSocket + REST end-to-end flow (hello, mapping, session start, timeline dispatch with ACK, mic uplink, session stop)
+- Large-audio URL delivery path
+- Dashboard transcript extraction from session events
 
 ## Firmware Starter
 

@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
     host: str = "0.0.0.0"
     port: int = 8011
+    public_base_url: str = "https://chip.iampc.uk:13382"
 
     database_url: str = "sqlite+aiosqlite:///./data/devicebridge.db"
 
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
 
     device_session_timeout_s: int = 120
     command_ack_timeout_s: float = 3.0
+    device_inline_audio_max_bytes: int = 240000
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
 

@@ -131,6 +131,24 @@ def _timeline_summary_from_events(events: list[dict[str, Any]]) -> dict[str, lis
     return out
 
 
+def _conversation_from_events(events: list[dict[str, Any]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for event in events:
+        payload = event.get("payload", {})
+        if event["event_type"] == "ptt.agent_response":
+            transcript = str(payload.get("transcript", "") or "").strip()
+            text = str(payload.get("text", "") or "").strip()
+            if transcript:
+                out.append({"role": "user", "text": transcript})
+            if text:
+                out.append({"role": "assistant", "text": text})
+        elif event["event_type"] == "agent.output":
+            text = str(payload.get("text", "") or "").strip()
+            if text and not (out and out[-1]["role"] == "assistant" and out[-1]["text"] == text):
+                out.append({"role": "assistant", "text": text})
+    return out
+
+
 def _session_files(session_id: str) -> list[dict[str, Any]]:
     if not DATA_ROOT.exists():
         return []
@@ -224,6 +242,11 @@ async def admin_page() -> str:
     .section{display:flex;flex-direction:column;gap:12px}
     .files a{display:block;color:var(--accent);text-decoration:none;padding:7px 0;border-bottom:1px solid rgba(116,216,255,.08)}
     .files a:last-child{border-bottom:none}
+    .chat{display:flex;flex-direction:column;gap:10px}
+    .chatmsg{padding:10px 12px;border-radius:14px;border:1px solid rgba(116,216,255,.12);background:#08111a}
+    .chatmsg.user{border-color:#2f7f5b;background:#091711}
+    .chatmsg.assistant{border-color:#2a718f;background:#091520}
+    .chatmsg .role{font-size:12px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.08em}
     .error{color:#ffb4c0}
     @media (max-width:1320px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
   </style>
@@ -325,6 +348,8 @@ async def admin_page() -> str:
         </div>
         <div id="sessionSummary" class="muted">No session selected.</div>
         <div id="filesLinks" class="files scroll"></div>
+        <h3>Transcript</h3>
+        <div id="chatLog" class="chat scroll"></div>
       </section>
     </div>
   </div>
@@ -400,6 +425,7 @@ function renderSelected(device){
     byId('eventStream').innerHTML = '';
     byId('sessionSelect').innerHTML = '';
     byId('filesLinks').innerHTML = '';
+    byId('chatLog').innerHTML = '';
     byId('sessionSummary').textContent = 'No session selected.';
     return;
   }
@@ -458,6 +484,7 @@ function renderSelected(device){
     byId('mappingJson').value = '';
   }
   renderFiles(device);
+  renderChat(device);
 }
 
 function renderFiles(device){
@@ -465,6 +492,17 @@ function renderFiles(device){
   byId('sessionSummary').textContent = session ? `${session.session_id} | ${session.active?'active':'closed'} | started ${fmtDate(session.started_at)}` : 'No session selected.';
   const box = byId('filesLinks');
   box.innerHTML = (session?.files || []).map(f => `<a href="${esc(f.download_url)}" target="_blank">${esc(f.path)} <span class="muted">(${f.size_bytes} bytes)</span></a>`).join('') || '<div class="event muted">No artifacts for this session yet.</div>';
+}
+
+function renderChat(device){
+  const session = device.sessions.find(s => s.session_id === selectedSessionId) || device.latest_session || null;
+  const box = byId('chatLog');
+  box.innerHTML = (session?.conversation || []).map(msg => `
+    <div class="chatmsg ${esc(msg.role)}">
+      <div class="role">${esc(msg.role)}</div>
+      <div>${esc(msg.text)}</div>
+    </div>
+  `).join('') || '<div class="event muted">No transcript yet. If STT succeeds, user transcript and assistant reply will appear here.</div>';
 }
 
 async function saveBrain(){
@@ -656,6 +694,7 @@ async def dashboard(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
                 for event in events
             ]
             timeline = _timeline_summary_from_events(raw_event_payloads)
+            conversation = _conversation_from_events(raw_event_payloads)
             files = _session_files(session.session_id)
             payload = {
                 "session_id": session.session_id,
@@ -667,6 +706,7 @@ async def dashboard(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
                 "ended_at": session.ended_at.isoformat() if session.ended_at else None,
                 "events": event_payloads,
                 "timeline": timeline,
+                "conversation": conversation,
                 "last_error": next((item["payload"].get("error", "") for item in reversed(event_payloads) if item["event_type"] == "ptt.error"), ""),
                 "has_audio_in": any("/audio_in/" in file_info["path"] for file_info in files),
                 "has_audio_out": any("/audio_out/" in file_info["path"] for file_info in files),
@@ -827,6 +867,18 @@ async def download_file(path: str) -> FileResponse:
     if root not in requested.parents and requested != root:
         raise HTTPException(status_code=403, detail="path not allowed")
     return FileResponse(requested, filename=requested.name)
+
+
+@router.get("/api/device/sessions/{session_id}/audio/{filename}")
+async def device_audio_file(session_id: str, filename: str) -> FileResponse:
+    matches = list(DATA_ROOT.glob(f"*/sessions/{session_id}/audio_out/{filename}"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="audio file not found")
+    path = matches[0].resolve()
+    root = DATA_ROOT.resolve()
+    if root not in path.parents:
+        raise HTTPException(status_code=403, detail="path not allowed")
+    return FileResponse(path, filename=path.name, media_type="audio/wav")
 
 
 @router.post("/api/admin/mappings/suggest", response_model=MappingSuggestOut)

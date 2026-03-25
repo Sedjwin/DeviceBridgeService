@@ -117,6 +117,18 @@ async def _ensure_agentmanager_session(device_id: str, agent_id: str) -> tuple[s
     return bridge_session_id, upstream_session_id
 
 
+async def _restore_runtime_session(device_id: str, bridge_session_id: str) -> bool:
+    async with get_session_ctx() as db:
+        row = await db.get(BridgeSession, bridge_session_id)
+        if row is None or row.device_id != device_id:
+            return False
+    state = await runtime.get_device_state(device_id)
+    state.agent_id = row.agent_id
+    state.bridge_session_id = row.session_id
+    state.upstream_session_id = row.upstream_session_id
+    return True
+
+
 async def _process_ptt_stop(device_id: str) -> None:
     state = await runtime.get_device_state(device_id)
     if not state.bridge_session_id or not state.upstream_session_id or not state.mic_chunks:
@@ -160,13 +172,19 @@ async def _process_ptt_stop(device_id: str) -> None:
             db,
             session_id=state.bridge_session_id,
             event_type="ptt.agent_response",
-            payload={"text": agent_resp.get("text", ""), "has_audio": bool(agent_resp.get("audio"))},
+            payload={
+                "transcript": agent_resp.get("transcript", "") or "",
+                "text": agent_resp.get("text", "") or "",
+                "has_audio": bool(agent_resp.get("audio")),
+                "sample_rate": agent_resp.get("sample_rate"),
+            },
         )
 
     # Feed back into existing DBS dispatch pipeline.
     payload = {
         "text": agent_resp.get("text", ""),
         "audio_base64": agent_resp.get("audio"),
+        "sample_rate": agent_resp.get("sample_rate"),
         "timeline": agent_resp.get("timeline", []) or [],
         "profile": None,
         "voice_config": None,
@@ -187,10 +205,6 @@ async def _process_ptt_stop(device_id: str) -> None:
                     event_type="ptt.error",
                     payload={"stage": "device_dispatch", "error": response.text[:400], "errors": response_errors},
                 )
-
-    if agent_resp.get("audio"):
-        audio_out_path = DATA_ROOT / device_id / "sessions" / state.bridge_session_id / "audio_out" / f"{turn_id}.wav.b64"
-        _write_file(audio_out_path, str(agent_resp.get("audio")).encode("utf-8"))
 
     state.mic_chunks.clear()
 
@@ -273,6 +287,9 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                 state = await runtime.get_device_state(device_id)
                 sample_rate = int(msg.get("sample_rate", state.sample_rate or 16000))
                 state.sample_rate = sample_rate
+                incoming_session_id = str(msg.get("session_id", "")).strip()
+                if incoming_session_id and not state.bridge_session_id:
+                    await _restore_runtime_session(device_id, incoming_session_id)
                 audio_base64 = str(msg.get("audio_base64", ""))
                 raw_chunk = _safe_decode_b64(audio_base64)
                 if raw_chunk:
@@ -291,7 +308,7 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
                 if raw_chunk and not state.listening:
                     asyncio.create_task(_schedule_legacy_stop(device_id, state.mic_activity_token))
 
-                session_id = str(msg.get("session_id", "")) or state.bridge_session_id
+                session_id = incoming_session_id or state.bridge_session_id
                 if session_id:
                     await runtime.publish_mic(session_id, msg)
                     async with get_session_ctx() as db:
@@ -342,9 +359,18 @@ async def ws_device(device_id: str, websocket: WebSocket) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.exception("websocket error device=%s err=%s", device_id, exc)
     finally:
+        state = await runtime.get_device_state(device_id)
+        bridge_session_id = state.bridge_session_id
         await hub.disconnect(device_id)
         await runtime.clear_device_state(device_id)
         async with get_session_ctx() as db:
+            if bridge_session_id:
+                await store.add_session_event(
+                    db,
+                    session_id=bridge_session_id,
+                    event_type="device.disconnect",
+                    payload={"device_id": device_id},
+                )
             row = await db.get(Device, device_id)
             if row is not None:
                 row.online = False

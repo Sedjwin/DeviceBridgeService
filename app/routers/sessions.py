@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import time
 import asyncio
+import base64
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -20,11 +22,27 @@ from app.services import store
 
 router = APIRouter(prefix="/api", tags=["sessions"])
 mapper = MappingEngine()
+DATA_ROOT = Path("data/devices")
 
 
 async def _emit_debug(session_id: str, event: str, payload: dict) -> None:
     data = {"event": event, **payload, "ts": int(time.time() * 1000)}
     await runtime.publish_debug(session_id, data)
+
+
+def _write_file(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def _materialize_audio_output(device_id: str, session_id: str, audio_base64: str) -> tuple[Path, int]:
+    audio_bytes = base64.b64decode(audio_base64)
+    audio_out_dir = DATA_ROOT / device_id / "sessions" / session_id / "audio_out"
+    wav_path = audio_out_dir / "reply.wav"
+    b64_path = audio_out_dir / "reply.wav.b64"
+    _write_file(wav_path, audio_bytes)
+    _write_file(b64_path, audio_base64.encode("utf-8"))
+    return wav_path, len(audio_bytes)
 
 
 @router.post("/sessions/start", response_model=SessionOut)
@@ -64,15 +82,42 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
         raise HTTPException(status_code=404, detail="session not found")
 
     await _emit_debug(session_id, "audio_start", {"bytes_b64": len(payload.audio_base64)})
+    audio_path, audio_size = _materialize_audio_output(row.device_id, session_id, payload.audio_base64)
+
+    if audio_size <= settings.device_inline_audio_max_bytes:
+        command_type = "audio.play"
+        command_payload = {
+            "session_id": session_id,
+            "audio_base64": payload.audio_base64,
+            "sample_rate": payload.sample_rate,
+        }
+    else:
+        command_type = "audio.play_url"
+        command_payload = {
+            "session_id": session_id,
+            "url": (
+                f"{settings.public_base_url.rstrip('/')}"
+                f"/api/device/sessions/{session_id}/audio/{audio_path.name}"
+            ),
+            "sample_rate": payload.sample_rate,
+            "content_type": "audio/wav",
+            "bytes": audio_size,
+        }
+
     command_id = await hub.dispatch_command(
         row.device_id,
-        "audio.play",
-        {"session_id": session_id, "audio_base64": payload.audio_base64, "sample_rate": payload.sample_rate},
+        command_type,
+        command_payload,
         require_ack=True,
     )
-    await store.add_session_event(db, session_id=session_id, event_type="audio.play", payload={"command_id": command_id})
+    await store.add_session_event(
+        db,
+        session_id=session_id,
+        event_type=command_type,
+        payload={"command_id": command_id, "bytes": audio_size, "path": str(audio_path)},
+    )
     await _emit_debug(session_id, "audio_done", {"command_id": command_id})
-    return {"status": "ok", "command_id": command_id}
+    return {"status": "ok", "command_id": command_id, "command_type": command_type, "bytes": audio_size}
 
 
 @router.post("/sessions/{session_id}/agent-timeline")
@@ -196,7 +241,7 @@ async def post_agent_output(session_id: str, payload: AgentOutputIn, db: AsyncSe
         try:
             audio_result = await post_agent_audio(
                 session_id,
-                AgentAudioIn(audio_base64=payload.audio_base64),
+                AgentAudioIn(audio_base64=payload.audio_base64, sample_rate=payload.sample_rate or 22050),
                 db,
             )
         except Exception as exc:  # noqa: BLE001

@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <mbedtls/base64.h>
@@ -211,21 +213,159 @@ static void sendDeviceStatus() {
   wsSendJson(st);
 }
 
-static void playAudioBase64(const char *audioB64) {
+static size_t wavPayloadOffset(const uint8_t *data, size_t len) {
+  if (!data || len < 44) {
+    return 0;
+  }
+  if (memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
+    return 0;
+  }
+  for (size_t i = 12; i + 8 <= len; ) {
+    const uint32_t chunkSize =
+      ((uint32_t)data[i + 4]) |
+      ((uint32_t)data[i + 5] << 8) |
+      ((uint32_t)data[i + 6] << 16) |
+      ((uint32_t)data[i + 7] << 24);
+    if (memcmp(data + i, "data", 4) == 0) {
+      size_t start = i + 8;
+      if (start <= len) {
+        return start;
+      }
+      return 0;
+    }
+    i += 8 + chunkSize;
+    if (chunkSize & 1U) {
+      i += 1;
+    }
+  }
+  return 0;
+}
+
+static void playPcmBuffer(const uint8_t *data, size_t len) {
+  if (!data || len == 0) {
+    return;
+  }
+  size_t offset = wavPayloadOffset(data, len);
+  if (offset > 0 && offset < len) {
+    data += offset;
+    len -= offset;
+  }
+  const size_t chunk = 1024;
+  size_t cursor = 0;
+  while (cursor < len) {
+    size_t n = (len - cursor > chunk) ? chunk : (len - cursor);
+    g_audio->I2sAudio_PlayWrite((uint8_t *)(data + cursor), n);
+    cursor += n;
+  }
+}
+
+static bool playAudioBase64(const char *audioB64) {
   uint8_t *pcm = nullptr;
   size_t pcmLen = 0;
   if (!base64Decode(audioB64, &pcm, &pcmLen)) {
-    return;
+    return false;
+  }
+  playPcmBuffer(pcm, pcmLen);
+  free(pcm);
+  return true;
+}
+
+static bool playAudioFromUrl(const char *url) {
+  if (!url || strlen(url) == 0 || WiFi.status() != WL_CONNECTED) {
+    return false;
   }
 
-  const size_t chunk = 1024;
-  size_t offset = 0;
-  while (offset < pcmLen) {
-    size_t n = (pcmLen - offset > chunk) ? chunk : (pcmLen - offset);
-    g_audio->I2sAudio_PlayWrite(pcm + offset, n);
-    offset += n;
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  WiFiClient plainClient;
+  bool ok = false;
+
+  if (strncmp(url, "https://", 8) == 0) {
+    secureClient.setInsecure();
+    if (!http.begin(secureClient, url)) {
+      return false;
+    }
+  } else {
+    if (!http.begin(plainClient, url)) {
+      return false;
+    }
   }
-  free(pcm);
+
+  int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  int total = http.getSize();
+  uint8_t *buffer = nullptr;
+  if (total > 0) {
+    buffer = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buffer) {
+      buffer = (uint8_t *)malloc(total);
+    }
+  }
+
+  if (buffer && total > 0) {
+    size_t readBytes = 0;
+    while (http.connected() && readBytes < (size_t)total) {
+      size_t avail = stream->available();
+      if (!avail) {
+        delay(2);
+        continue;
+      }
+      int got = stream->readBytes(buffer + readBytes, avail);
+      if (got <= 0) {
+        break;
+      }
+      readBytes += (size_t)got;
+    }
+    if (readBytes > 0) {
+      playPcmBuffer(buffer, readBytes);
+      ok = true;
+    }
+    free(buffer);
+  } else {
+    static uint8_t streamBuf[1024];
+    bool firstChunk = true;
+    uint8_t headerBuf[96];
+    size_t headerLen = 0;
+    size_t skip = 0;
+    while (http.connected()) {
+      size_t avail = stream->available();
+      if (!avail) {
+        if (!http.connected()) {
+          break;
+        }
+        delay(2);
+        continue;
+      }
+      int got = stream->readBytes(streamBuf, min(avail, sizeof(streamBuf)));
+      if (got <= 0) {
+        break;
+      }
+      if (firstChunk) {
+        size_t copyLen = (size_t)got < sizeof(headerBuf) ? (size_t)got : sizeof(headerBuf);
+        memcpy(headerBuf, streamBuf, copyLen);
+        headerLen = copyLen;
+        skip = wavPayloadOffset(headerBuf, headerLen);
+        firstChunk = false;
+        if (skip >= (size_t)got) {
+          continue;
+        }
+      }
+      size_t start = skip;
+      skip = 0;
+      if (start < (size_t)got) {
+        g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
+        ok = true;
+      }
+    }
+  }
+
+  http.end();
+  return ok;
 }
 
 // ====== WebSocket Events ======
@@ -275,12 +415,35 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         g_sessionId = String(sessionId);
 
         if (strlen(audioB64) > 0) {
+          sendAck(commandId, true);
           g_anim = AVATAR_TALK;
+          setStatus("Speaking...");
           playAudioBase64(audioB64);
           g_anim = AVATAR_IDLE;
-          sendAck(commandId, true);
+          setStatus("Ready");
         } else {
           sendAck(commandId, false, "empty audio payload");
+        }
+        return;
+      }
+
+      if (strcmp(msgType, "audio.play_url") == 0) {
+        const char *sessionId = doc["payload"]["session_id"] | "";
+        const char *url = doc["payload"]["url"] | "";
+        g_sessionId = String(sessionId);
+
+        if (strlen(url) > 0) {
+          sendAck(commandId, true);
+          g_anim = AVATAR_TALK;
+          setStatus("Speaking...");
+          if (!playAudioFromUrl(url)) {
+            setStatus("Audio fetch failed");
+          } else {
+            setStatus("Ready");
+          }
+          g_anim = AVATAR_IDLE;
+        } else {
+          sendAck(commandId, false, "empty audio url");
         }
         return;
       }

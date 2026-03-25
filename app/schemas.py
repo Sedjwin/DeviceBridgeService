@@ -69,6 +69,7 @@ class TimelineEvent(BaseModel):
 class AgentOutputIn(BaseModel):
     text: str = ""
     audio_base64: str | None = None
+    sample_rate: int | None = None
     timeline: list[TimelineEvent] = Field(default_factory=list)
     profile: dict[str, Any] | None = None
     voice_config: dict[str, Any] | None = None
