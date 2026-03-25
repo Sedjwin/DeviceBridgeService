@@ -126,7 +126,9 @@ def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sa
     except (TypeError, ValueError):
         inline_limit = settings.device_inline_audio_max_bytes
 
-    use_inline = "inline" in methods and (preferred_method == "inline" or "url" not in methods or audio_size <= inline_limit)
+    use_inline = "inline" in methods and audio_size <= inline_limit and (
+        preferred_method == "inline" or "url" not in methods
+    )
     if use_inline:
         return (
             "audio.play",
