@@ -12,6 +12,9 @@
 #include "lvgl_port.h"
 #include "src/audio_bsp/user_audio.h"
 
+// Build ID:
+// DBS_AVATAR_2026_03_25_1819
+
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
 static const char *WIFI_PASS = "Houses06";
@@ -21,6 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1819";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -305,7 +309,7 @@ static void sendHello() {
   doc["type"] = "hello";
   doc["name"] = "Waveshare ESP32-S3 1.32 AMOLED";
   doc["model"] = "esp32s3-waveshare-1.32-amoled";
-  doc["firmware_version"] = "0.1.0-dbs-avatar";
+  doc["firmware_version"] = FIRMWARE_VERSION;
 
   JsonObject caps = doc.createNestedObject("capabilities");
   JsonArray renderModes = caps.createNestedArray("render_modes");
@@ -453,7 +457,6 @@ static bool playAudioBase64(const char *audioB64, uint32_t sampleRate) {
 
 static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   if (!url || strlen(url) == 0 || WiFi.status() != WL_CONNECTED) {
-    g_lastError = "audio_url_invalid";
     return false;
   }
 
@@ -465,19 +468,16 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   if (strncmp(url, "https://", 8) == 0) {
     secureClient.setInsecure();
     if (!http.begin(secureClient, url)) {
-      g_lastError = "http_begin_failed_https";
       return false;
     }
   } else {
     if (!http.begin(plainClient, url)) {
-      g_lastError = "http_begin_failed_http";
       return false;
     }
   }
 
   int status = http.GET();
   if (status != HTTP_CODE_OK) {
-    g_lastError = String("http_status_") + String(status);
     http.end();
     return false;
   }
@@ -485,59 +485,79 @@ static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   setOutputSampleRate(sampleRate);
 
   WiFiClient *stream = http.getStreamPtr();
-  static uint8_t streamBuf[1024];
-  bool firstChunk = true;
-  uint8_t headerBuf[96];
-  size_t headerLen = 0;
-  size_t skip = 0;
-  size_t bytesPlayed = 0;
-  uint32_t idleLoops = 0;
-  beginPlayback(g_playbackSampleRate);
-  while (http.connected()) {
-    size_t avail = stream->available();
-    if (!avail) {
-      idleLoops++;
-      if (idleLoops > 3000) {
-        g_lastError = "audio_stream_timeout";
-        break;
-      }
-      delay(2);
-      continue;
+  int total = http.getSize();
+  uint8_t *buffer = nullptr;
+  if (total > 0) {
+    buffer = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buffer) {
+      buffer = (uint8_t *)malloc(total);
     }
-    idleLoops = 0;
-    int got = stream->readBytes(streamBuf, min(avail, sizeof(streamBuf)));
-    if (got <= 0) {
-      g_lastError = "audio_stream_read_failed";
-      break;
-    }
-    if (firstChunk) {
-      size_t copyLen = (size_t)got < sizeof(headerBuf) ? (size_t)got : sizeof(headerBuf);
-      memcpy(headerBuf, streamBuf, copyLen);
-      headerLen = copyLen;
-      skip = wavPayloadOffset(headerBuf, headerLen);
-      firstChunk = false;
-      if (skip >= (size_t)got) {
+  }
+
+  if (buffer && total > 0) {
+    size_t readBytes = 0;
+    while (http.connected() && readBytes < (size_t)total) {
+      size_t avail = stream->available();
+      if (!avail) {
+        delay(2);
         continue;
       }
+      int got = stream->readBytes(buffer + readBytes, avail);
+      if (got <= 0) {
+        break;
+      }
+      readBytes += (size_t)got;
     }
-    size_t start = skip;
-    skip = 0;
-    if (start < (size_t)got) {
-      uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
-      updateVisemeProgress(elapsedMs);
-      g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
-      bytesPlayed += ((size_t)got - start);
+    if (readBytes > 0) {
+      playPcmBuffer(buffer, readBytes);
       ok = true;
     }
+    free(buffer);
+  } else {
+    static uint8_t streamBuf[1024];
+    bool firstChunk = true;
+    uint8_t headerBuf[96];
+    size_t headerLen = 0;
+    size_t skip = 0;
+    size_t bytesPlayed = 0;
+    beginPlayback(g_playbackSampleRate);
+    while (http.connected()) {
+      size_t avail = stream->available();
+      if (!avail) {
+        if (!http.connected()) {
+          break;
+        }
+        delay(2);
+        continue;
+      }
+      int got = stream->readBytes(streamBuf, min(avail, sizeof(streamBuf)));
+      if (got <= 0) {
+        break;
+      }
+      if (firstChunk) {
+        size_t copyLen = (size_t)got < sizeof(headerBuf) ? (size_t)got : sizeof(headerBuf);
+        memcpy(headerBuf, streamBuf, copyLen);
+        headerLen = copyLen;
+        skip = wavPayloadOffset(headerBuf, headerLen);
+        firstChunk = false;
+        if (skip >= (size_t)got) {
+          continue;
+        }
+      }
+      size_t start = skip;
+      skip = 0;
+      if (start < (size_t)got) {
+        uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+        updateVisemeProgress(elapsedMs);
+        g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
+        bytesPlayed += ((size_t)got - start);
+        ok = true;
+      }
+    }
+    endPlayback();
   }
-  endPlayback();
 
   http.end();
-  if (ok) {
-    g_lastError = "";
-  } else if (g_lastError.length() == 0) {
-    g_lastError = "audio_stream_empty";
-  }
   return ok;
 }
 
@@ -968,6 +988,13 @@ static void setupWifi() {
 void setup() {
   Serial.begin(115200);
   randomSeed(micros());
+  Serial.println();
+  Serial.print("Firmware: ");
+  Serial.println(FIRMWARE_VERSION);
+  Serial.print("DBS host: ");
+  Serial.print(DBS_HOST);
+  Serial.print(":");
+  Serial.println(DBS_PORT);
 
   g_wsMutex = xSemaphoreCreateMutex();
 
