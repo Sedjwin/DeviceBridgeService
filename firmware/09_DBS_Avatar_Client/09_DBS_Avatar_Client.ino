@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_2212
+// DBS_AVATAR_2026_03_25_2222
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2212";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_2222";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -139,9 +139,11 @@ static lv_point_t g_poly5[2];
 // ====== Utils ======
 static void sendPhaseLog(const char *level, const char *phase, const String &message, const char *errorCode = nullptr);
 static bool wsQueuePush(const String &payload);
+static bool wsQueuePushFront(const String &payload);
 static bool wsQueuePeek(String &payload);
 static bool wsQueueDropFront();
 static void wsQueueClear();
+static void wsQueueDropMicChunks();
 static void wsFlushQueuedMessages();
 
 static bool wsQueuePush(const String &payload) {
@@ -157,6 +159,24 @@ static bool wsQueuePush(const String &payload) {
   }
   g_wsTxQueue[g_wsTxTail] = payload;
   g_wsTxTail = (g_wsTxTail + 1U) % WS_TX_QUEUE_CAP;
+  g_wsTxCount++;
+  xSemaphoreGive(g_wsQueueMutex);
+  return true;
+}
+
+static bool wsQueuePushFront(const String &payload) {
+  if (!g_wsQueueMutex) {
+    return false;
+  }
+  if (!xSemaphoreTake(g_wsQueueMutex, pdMS_TO_TICKS(20))) {
+    return false;
+  }
+  if (g_wsTxCount >= WS_TX_QUEUE_CAP) {
+    xSemaphoreGive(g_wsQueueMutex);
+    return false;
+  }
+  g_wsTxHead = (g_wsTxHead + WS_TX_QUEUE_CAP - 1U) % WS_TX_QUEUE_CAP;
+  g_wsTxQueue[g_wsTxHead] = payload;
   g_wsTxCount++;
   xSemaphoreGive(g_wsQueueMutex);
   return true;
@@ -212,6 +232,37 @@ static void wsQueueClear() {
   xSemaphoreGive(g_wsQueueMutex);
 }
 
+static void wsQueueDropMicChunks() {
+  if (!g_wsQueueMutex) {
+    return;
+  }
+  if (!xSemaphoreTake(g_wsQueueMutex, pdMS_TO_TICKS(50))) {
+    return;
+  }
+  String kept[WS_TX_QUEUE_CAP];
+  size_t keptCount = 0;
+  for (size_t i = 0; i < g_wsTxCount; ++i) {
+    size_t idx = (g_wsTxHead + i) % WS_TX_QUEUE_CAP;
+    const String &payload = g_wsTxQueue[idx];
+    if (payload.indexOf("\"type\":\"mic.chunk\"") >= 0) {
+      continue;
+    }
+    kept[keptCount++] = payload;
+  }
+  for (size_t i = 0; i < WS_TX_QUEUE_CAP; ++i) {
+    g_wsTxQueue[i] = "";
+  }
+  g_wsTxHead = 0;
+  g_wsTxTail = 0;
+  g_wsTxCount = 0;
+  for (size_t i = 0; i < keptCount; ++i) {
+    g_wsTxQueue[g_wsTxTail] = kept[i];
+    g_wsTxTail = (g_wsTxTail + 1U) % WS_TX_QUEUE_CAP;
+    g_wsTxCount++;
+  }
+  xSemaphoreGive(g_wsQueueMutex);
+}
+
 static bool wsSendJson(const JsonDocument &doc) {
   String payload;
   serializeJson(doc, payload);
@@ -219,6 +270,15 @@ static bool wsSendJson(const JsonDocument &doc) {
     return false;
   }
   return wsQueuePush(payload);
+}
+
+static bool wsSendJsonFront(const JsonDocument &doc) {
+  String payload;
+  serializeJson(doc, payload);
+  if (!g_wsConnected) {
+    return false;
+  }
+  return wsQueuePushFront(payload);
 }
 
 static void wsFlushQueuedMessages() {
@@ -510,10 +570,11 @@ static void stopListening() {
   g_anim = AVATAR_IDLE;
   setStatus("Processing...");
   sendPhaseLog("info", "ptt_release", "PTT stop");
+  wsQueueDropMicChunks();
   StaticJsonDocument<256> stop;
   stop["type"] = "ptt.stop";
   stop["session_id"] = g_sessionId;
-  wsSendJson(stop);
+  wsSendJsonFront(stop);
 }
 
 // ====== DBS Protocol ======
