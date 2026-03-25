@@ -149,12 +149,27 @@ async def _process_ptt_stop(device_id: str) -> None:
         )
 
     files = {"audio": ("input.wav", wav_bytes, "audio/wav")}
-    am_audio_url = f"{settings.agentmanager_url.rstrip('/')}/sessions/{state.upstream_session_id}/audio"
+    agent_resp: dict | None = None
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            am_res = await client.post(am_audio_url, files=files)
-            am_res.raise_for_status()
-            agent_resp = am_res.json()
+            for attempt in range(2):
+                am_audio_url = f"{settings.agentmanager_url.rstrip('/')}/sessions/{state.upstream_session_id}/audio"
+                am_res = await client.post(am_audio_url, files=files)
+                if am_res.status_code == 404 and attempt == 0 and state.agent_id:
+                    logger.warning(
+                        "upstream session missing, recreating agentmanager session device=%s bridge=%s upstream=%s",
+                        device_id,
+                        state.bridge_session_id,
+                        state.upstream_session_id,
+                    )
+                    _, new_upstream_session_id = await _ensure_agentmanager_session(device_id, state.agent_id)
+                    state.upstream_session_id = new_upstream_session_id
+                    continue
+                am_res.raise_for_status()
+                agent_resp = am_res.json()
+                break
+        if agent_resp is None:
+            raise RuntimeError("agentmanager audio request returned no response")
     except Exception as exc:  # noqa: BLE001
         logger.exception("ptt stop processing failed device=%s session=%s err=%s", device_id, state.bridge_session_id, exc)
         async with get_session_ctx() as db:
