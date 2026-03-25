@@ -45,6 +45,26 @@ def _materialize_audio_output(device_id: str, session_id: str, audio_base64: str
     return wav_path, len(audio_bytes)
 
 
+def _compress_visemes(timeline: list) -> list[dict]:
+    visemes = [event for event in timeline if getattr(event, "type", "") == "viseme"]
+    if not visemes:
+        return []
+
+    out: list[dict] = []
+    last_value: str | int | None = None
+    last_t = -999999
+    for event in visemes:
+        value = event.value
+        if value == last_value and (event.t - last_t) < 90:
+            continue
+        out.append({"t": int(event.t), "value": value})
+        last_value = value
+        last_t = int(event.t)
+        if len(out) >= 160:
+            break
+    return out
+
+
 @router.post("/sessions/start", response_model=SessionOut)
 async def start_session(payload: SessionStartIn, db: AsyncSession = Depends(get_db)) -> SessionOut:
     device = await db.get(Device, payload.device_id)
@@ -90,6 +110,7 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
             "session_id": session_id,
             "audio_base64": payload.audio_base64,
             "sample_rate": payload.sample_rate,
+            "visemes": _compress_visemes(payload.visemes),
         }
     else:
         command_type = "audio.play_url"
@@ -102,6 +123,7 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
             "sample_rate": payload.sample_rate,
             "content_type": "audio/wav",
             "bytes": audio_size,
+            "visemes": _compress_visemes(payload.visemes),
         }
 
     command_id = await hub.dispatch_command(
@@ -241,7 +263,11 @@ async def post_agent_output(session_id: str, payload: AgentOutputIn, db: AsyncSe
         try:
             audio_result = await post_agent_audio(
                 session_id,
-                AgentAudioIn(audio_base64=payload.audio_base64, sample_rate=payload.sample_rate or 22050),
+                AgentAudioIn(
+                    audio_base64=payload.audio_base64,
+                    sample_rate=payload.sample_rate or 22050,
+                    visemes=payload.timeline,
+                ),
                 db,
             )
         except Exception as exc:  # noqa: BLE001

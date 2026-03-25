@@ -19,7 +19,7 @@ class MappingContext:
 
 class MappingEngine:
     def __init__(self, global_fallback_order: list[str] | None = None) -> None:
-        self.global_fallback_order = global_fallback_order or ["line", "shape", "photo_warp", "model3d"]
+        self.global_fallback_order = global_fallback_order or ["line", "shape", "cartoon", "photo_warp", "model3d"]
 
     def choose_render_mode(self, preferred_mode: str, supported_modes: list[str]) -> str:
         if preferred_mode in supported_modes:
@@ -127,6 +127,8 @@ def _pick_render_mode(preferred_render_mode: str, supported_modes: list[str], an
         return "line"
     if "shape" in anim_tokens and "shape" in supported_modes:
         return "shape"
+    if ("cartoon" in anim_tokens or "bold" in anim_tokens) and "cartoon" in supported_modes:
+        return "cartoon"
     if ("photo" in anim_tokens or "warp" in anim_tokens) and "photo_warp" in supported_modes:
         return "photo_warp"
     if ("3d" in anim_tokens or "mesh" in anim_tokens or "model" in anim_tokens) and "model3d" in supported_modes:

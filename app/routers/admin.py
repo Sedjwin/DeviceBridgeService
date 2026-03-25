@@ -322,6 +322,7 @@ async def admin_page() -> str:
             <select id="modeSelect">
               <option value="line">line</option>
               <option value="shape">shape</option>
+              <option value="cartoon">cartoon</option>
               <option value="photo_warp">photo_warp</option>
               <option value="model3d">model3d</option>
             </select>

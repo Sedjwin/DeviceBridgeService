@@ -195,6 +195,12 @@ Included tests:
 
 - Waveshare sketch: [firmware/09_DBS_Avatar_Client/09_DBS_Avatar_Client.ino](firmware/09_DBS_Avatar_Client/09_DBS_Avatar_Client.ino)
 - Setup notes: [firmware/09_DBS_Avatar_Client/README.md](firmware/09_DBS_Avatar_Client/README.md)
+- Current sketch features:
+  - hold-to-talk PTT
+  - large-audio playback via `audio.play_url`
+  - viseme timeline payload support
+  - idle blink/tilt/scan behavior
+  - swipe left/right render-mode cycling (`line`, `shape`, `cartoon`, `model3d`)
 
 ## Current Boundaries
 

@@ -99,6 +99,7 @@ class SessionStopOut(BaseModel):
 class AgentAudioIn(BaseModel):
     audio_base64: str
     sample_rate: int = 22050
+    visemes: list[TimelineEvent] = Field(default_factory=list)
 
 
 class AgentTimelineIn(BaseModel):

@@ -41,11 +41,13 @@ float g_animTime = 0.0f;
 static lv_obj_t *g_root = nullptr;
 static lv_obj_t *g_pttOverlay = nullptr;
 static lv_obj_t *g_statusLabel = nullptr;
+static lv_obj_t *g_facePanel = nullptr;
 static lv_obj_t *g_wireLines[6];
 static lv_obj_t *g_eyeL = nullptr;
 static lv_obj_t *g_eyeR = nullptr;
 static lv_obj_t *g_mouth = nullptr;
 static lv_style_t g_lineStyle;
+static lv_style_t g_faceStyle;
 
 enum AvatarAnim {
   AVATAR_IDLE,
@@ -57,6 +59,36 @@ enum AvatarAnim {
 };
 
 volatile AvatarAnim g_anim = AVATAR_IDLE;
+
+enum RenderMode {
+  RENDER_LINE = 0,
+  RENDER_SHAPE = 1,
+  RENDER_CARTOON = 2,
+  RENDER_MODEL3D = 3,
+};
+
+struct VisemeFrame {
+  uint16_t t;
+  uint8_t value;
+};
+
+static RenderMode g_renderMode = RENDER_LINE;
+static const size_t MAX_VISEMES = 160;
+static VisemeFrame g_visemes[MAX_VISEMES];
+static size_t g_visemeCount = 0;
+static size_t g_visemeIndex = 0;
+static volatile uint8_t g_activeViseme = 0;
+static volatile bool g_audioPlaying = false;
+static volatile bool g_touchTracking = false;
+static volatile bool g_swipeDetected = false;
+static volatile bool g_listenStarted = false;
+static volatile int16_t g_touchStartX = 0;
+static volatile int16_t g_touchStartY = 0;
+static volatile int16_t g_touchEndX = 0;
+static volatile uint32_t g_touchStartMs = 0;
+static uint32_t g_animHoldUntilMs = 0;
+static uint32_t g_nextIdleAnimMs = 0;
+static uint32_t g_playbackSampleRate = 16000;
 
 #if LVGL_VERSION_MAJOR >= 9
 static lv_point_precise_t g_poly0[2];
@@ -153,6 +185,117 @@ static void setAnimationByName(const String &name) {
   } else {
     g_anim = AVATAR_IDLE;
   }
+  g_animHoldUntilMs = millis() + 1400;
+}
+
+static const char *renderModeName(RenderMode mode) {
+  switch (mode) {
+    case RENDER_LINE: return "line";
+    case RENDER_SHAPE: return "shape";
+    case RENDER_CARTOON: return "cartoon";
+    case RENDER_MODEL3D: return "model3d";
+    default: return "line";
+  }
+}
+
+static void setRenderMode(RenderMode mode, bool announce = false) {
+  g_renderMode = mode;
+  if (announce) {
+    String text = String("Render: ") + renderModeName(mode);
+    setStatus(text.c_str());
+  }
+}
+
+static void cycleRenderMode(int direction) {
+  int next = (int)g_renderMode + direction;
+  if (next < 0) {
+    next = 3;
+  }
+  if (next > 3) {
+    next = 0;
+  }
+  setRenderMode((RenderMode)next, true);
+}
+
+static void clearVisemes() {
+  g_visemeCount = 0;
+  g_visemeIndex = 0;
+  g_activeViseme = 0;
+}
+
+static void loadVisemes(JsonVariantConst raw) {
+  clearVisemes();
+  if (!raw.is<JsonArrayConst>()) {
+    return;
+  }
+  JsonArrayConst arr = raw.as<JsonArrayConst>();
+  for (JsonObjectConst item : arr) {
+    if (g_visemeCount >= MAX_VISEMES) {
+      break;
+    }
+    g_visemes[g_visemeCount].t = (uint16_t)(item["t"] | 0);
+    g_visemes[g_visemeCount].value = (uint8_t)(item["value"] | 0);
+    g_visemeCount++;
+  }
+}
+
+static void updateVisemeProgress(uint32_t elapsedMs) {
+  if (!g_visemeCount) {
+    g_activeViseme = 0;
+    return;
+  }
+  while (g_visemeIndex + 1 < g_visemeCount && g_visemes[g_visemeIndex + 1].t <= elapsedMs) {
+    g_visemeIndex++;
+  }
+  g_activeViseme = g_visemes[g_visemeIndex].value;
+}
+
+static void setOutputSampleRate(uint32_t sampleRate) {
+  if (sampleRate < 8000 || sampleRate > 48000) {
+    sampleRate = 16000;
+  }
+  g_playbackSampleRate = sampleRate;
+  g_audio->I2sAudio_SetCodecInfo("mic&spk", 1, sampleRate, 2, 16);
+}
+
+static void beginPlayback(uint32_t sampleRate) {
+  setOutputSampleRate(sampleRate);
+  g_audioPlaying = true;
+  g_visemeIndex = 0;
+  g_activeViseme = 0;
+  setStatus("Speaking...");
+}
+
+static void endPlayback() {
+  g_audioPlaying = false;
+  clearVisemes();
+  g_anim = AVATAR_IDLE;
+  setOutputSampleRate(16000);
+  setStatus("Ready");
+}
+
+static void startListening() {
+  g_listening = true;
+  g_listenStarted = true;
+  clearVisemes();
+  setOutputSampleRate(16000);
+  g_anim = AVATAR_LISTEN;
+  setStatus("Listening... release to stop");
+  StaticJsonDocument<256> start;
+  start["type"] = "ptt.start";
+  start["agent_id"] = DEFAULT_AGENT_ID;
+  wsSendJson(start);
+}
+
+static void stopListening() {
+  g_listening = false;
+  g_listenStarted = false;
+  g_anim = AVATAR_IDLE;
+  setStatus("Ready");
+  StaticJsonDocument<256> stop;
+  stop["type"] = "ptt.stop";
+  stop["session_id"] = g_sessionId;
+  wsSendJson(stop);
 }
 
 // ====== DBS Protocol ======
@@ -167,6 +310,8 @@ static void sendHello() {
   JsonArray renderModes = caps.createNestedArray("render_modes");
   renderModes.add("line");
   renderModes.add("shape");
+  renderModes.add("cartoon");
+  renderModes.add("model3d");
 
   JsonArray anims = caps.createNestedArray("animations");
   anims.add("neutral_blink");
@@ -210,6 +355,8 @@ static void sendDeviceStatus() {
   JsonObject extra = st.createNestedObject("extra");
   extra["listening"] = g_listening;
   extra["session_id"] = g_sessionId;
+  extra["render_mode"] = renderModeName(g_renderMode);
+  extra["audio_playing"] = g_audioPlaying;
   wsSendJson(st);
 }
 
@@ -252,25 +399,30 @@ static void playPcmBuffer(const uint8_t *data, size_t len) {
   }
   const size_t chunk = 1024;
   size_t cursor = 0;
+  beginPlayback(g_playbackSampleRate);
   while (cursor < len) {
     size_t n = (len - cursor > chunk) ? chunk : (len - cursor);
+    uint32_t elapsedMs = (uint32_t)(((uint64_t)cursor * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+    updateVisemeProgress(elapsedMs);
     g_audio->I2sAudio_PlayWrite((uint8_t *)(data + cursor), n);
     cursor += n;
   }
+  endPlayback();
 }
 
-static bool playAudioBase64(const char *audioB64) {
+static bool playAudioBase64(const char *audioB64, uint32_t sampleRate) {
   uint8_t *pcm = nullptr;
   size_t pcmLen = 0;
   if (!base64Decode(audioB64, &pcm, &pcmLen)) {
     return false;
   }
+  setOutputSampleRate(sampleRate);
   playPcmBuffer(pcm, pcmLen);
   free(pcm);
   return true;
 }
 
-static bool playAudioFromUrl(const char *url) {
+static bool playAudioFromUrl(const char *url, uint32_t sampleRate) {
   if (!url || strlen(url) == 0 || WiFi.status() != WL_CONNECTED) {
     return false;
   }
@@ -296,6 +448,8 @@ static bool playAudioFromUrl(const char *url) {
     http.end();
     return false;
   }
+  setStatus("Fetching voice...");
+  setOutputSampleRate(sampleRate);
 
   WiFiClient *stream = http.getStreamPtr();
   int total = http.getSize();
@@ -332,6 +486,8 @@ static bool playAudioFromUrl(const char *url) {
     uint8_t headerBuf[96];
     size_t headerLen = 0;
     size_t skip = 0;
+    size_t bytesPlayed = 0;
+    beginPlayback(g_playbackSampleRate);
     while (http.connected()) {
       size_t avail = stream->available();
       if (!avail) {
@@ -358,10 +514,14 @@ static bool playAudioFromUrl(const char *url) {
       size_t start = skip;
       skip = 0;
       if (start < (size_t)got) {
+        uint32_t elapsedMs = (uint32_t)(((uint64_t)bytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+        updateVisemeProgress(elapsedMs);
         g_audio->I2sAudio_PlayWrite(streamBuf + start, (size_t)got - start);
+        bytesPlayed += ((size_t)got - start);
         ok = true;
       }
     }
+    endPlayback();
   }
 
   http.end();
@@ -404,6 +564,16 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
 
       if (strcmp(msgType, "avatar.anim") == 0) {
         const char *anim = doc["payload"]["animation"] | "neutral_blink";
+        const char *renderMode = doc["payload"]["render_mode"] | "";
+        if (strcmp(renderMode, "shape") == 0) {
+          setRenderMode(RENDER_SHAPE);
+        } else if (strcmp(renderMode, "cartoon") == 0) {
+          setRenderMode(RENDER_CARTOON);
+        } else if (strcmp(renderMode, "model3d") == 0) {
+          setRenderMode(RENDER_MODEL3D);
+        } else if (strcmp(renderMode, "line") == 0) {
+          setRenderMode(RENDER_LINE);
+        }
         setAnimationByName(String(anim));
         sendAck(commandId, true);
         return;
@@ -412,15 +582,13 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       if (strcmp(msgType, "audio.play") == 0) {
         const char *sessionId = doc["payload"]["session_id"] | "";
         const char *audioB64 = doc["payload"]["audio_base64"] | "";
+        uint32_t sampleRate = (uint32_t)(doc["payload"]["sample_rate"] | 16000);
         g_sessionId = String(sessionId);
 
         if (strlen(audioB64) > 0) {
+          loadVisemes(doc["payload"]["visemes"]);
           sendAck(commandId, true);
-          g_anim = AVATAR_TALK;
-          setStatus("Speaking...");
-          playAudioBase64(audioB64);
-          g_anim = AVATAR_IDLE;
-          setStatus("Ready");
+          playAudioBase64(audioB64, sampleRate);
         } else {
           sendAck(commandId, false, "empty audio payload");
         }
@@ -430,18 +598,15 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       if (strcmp(msgType, "audio.play_url") == 0) {
         const char *sessionId = doc["payload"]["session_id"] | "";
         const char *url = doc["payload"]["url"] | "";
+        uint32_t sampleRate = (uint32_t)(doc["payload"]["sample_rate"] | 16000);
         g_sessionId = String(sessionId);
 
         if (strlen(url) > 0) {
+          loadVisemes(doc["payload"]["visemes"]);
           sendAck(commandId, true);
-          g_anim = AVATAR_TALK;
-          setStatus("Speaking...");
-          if (!playAudioFromUrl(url)) {
+          if (!playAudioFromUrl(url, sampleRate)) {
             setStatus("Audio fetch failed");
-          } else {
-            setStatus("Ready");
           }
-          g_anim = AVATAR_IDLE;
         } else {
           sendAck(commandId, false, "empty audio url");
         }
@@ -469,26 +634,45 @@ static void updateAvatarFrame() {
   float sweep = sinf(g_animTime * 1.5f);
   int tilt = 0;
 
-  if (g_anim == AVATAR_HEAD_TILT) {
+  AvatarAnim activeAnim = g_anim;
+  if (g_audioPlaying) {
+    activeAnim = AVATAR_TALK;
+  } else if (g_listening) {
+    activeAnim = AVATAR_LISTEN;
+  }
+
+  if (activeAnim == AVATAR_HEAD_TILT) {
     tilt = (int)(sweep * 20.0f);
-  } else if (g_anim == AVATAR_SCAN_SWEEP) {
+  } else if (activeAnim == AVATAR_SCAN_SWEEP) {
     tilt = (int)(sweep * 35.0f);
   }
 
-  int headW = 210 + (g_anim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
-  int headH = 240 + (g_anim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
+  int headW = 210 + (activeAnim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
+  int headH = 240 + (activeAnim == AVATAR_LISTEN ? (int)(pulse * 8.0f) : 0);
 
   int lx = cx - 55 + tilt / 4;
   int rx = cx + 55 + tilt / 4;
   int ey = cy - 35;
 
   int eyeH = 20;
-  if (g_anim == AVATAR_BLINK) {
+  if (activeAnim == AVATAR_BLINK) {
     eyeH = 4;
   }
 
   int mouthW = 70;
-  int mouthH = (g_anim == AVATAR_TALK) ? (12 + (int)(fabsf(pulse) * 16.0f)) : 8;
+  int mouthH = 8;
+  if (g_audioPlaying) {
+    switch (g_activeViseme % 6) {
+      case 0: mouthW = 54; mouthH = 8; break;
+      case 1: mouthW = 42; mouthH = 24; break;
+      case 2: mouthW = 70; mouthH = 18; break;
+      case 3: mouthW = 32; mouthH = 28; break;
+      case 4: mouthW = 62; mouthH = 12; break;
+      default: mouthW = 48; mouthH = 20; break;
+    }
+  } else if (activeAnim == AVATAR_TALK) {
+    mouthH = 12 + (int)(fabsf(pulse) * 16.0f);
+  }
 
   // Wireframe low-poly face (6 line segments)
   g_poly0[0] = { (lv_coord_t)(cx - headW / 2), (lv_coord_t)(cy - headH / 2) };
@@ -516,6 +700,8 @@ static void updateAvatarFrame() {
   lv_line_set_points(g_wireLines[4], g_poly4, 2);
   lv_line_set_points(g_wireLines[5], g_poly5, 2);
 
+  lv_obj_set_pos(g_facePanel, cx - headW / 2, cy - headH / 2);
+  lv_obj_set_size(g_facePanel, headW, headH);
   lv_obj_set_pos(g_eyeL, lx - 10, ey - eyeH / 2);
   lv_obj_set_size(g_eyeL, 20, eyeH);
   lv_obj_set_pos(g_eyeR, rx - 10, ey - eyeH / 2);
@@ -523,6 +709,43 @@ static void updateAvatarFrame() {
 
   lv_obj_set_pos(g_mouth, cx - mouthW / 2 + tilt / 6, cy + 55);
   lv_obj_set_size(g_mouth, mouthW, mouthH);
+
+  if (g_renderMode == RENDER_LINE) {
+    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_TRANSP, 0);
+    for (int i = 0; i < 6; ++i) {
+      lv_obj_set_style_line_opa(g_wireLines[i], LV_OPA_90, 0);
+    }
+    lv_obj_set_style_bg_color(g_eyeL, lv_color_hex(0xB4F7FF), 0);
+    lv_obj_set_style_bg_color(g_eyeR, lv_color_hex(0xB4F7FF), 0);
+    lv_obj_set_style_bg_color(g_mouth, lv_color_hex(0x57D8FF), 0);
+  } else if (g_renderMode == RENDER_SHAPE) {
+    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_85, 0);
+    lv_obj_set_style_bg_color(g_facePanel, lv_color_hex(0x113245), 0);
+    for (int i = 0; i < 6; ++i) {
+      lv_obj_set_style_line_opa(g_wireLines[i], LV_OPA_25, 0);
+    }
+    lv_obj_set_style_bg_color(g_eyeL, lv_color_hex(0xC4FBFF), 0);
+    lv_obj_set_style_bg_color(g_eyeR, lv_color_hex(0xC4FBFF), 0);
+    lv_obj_set_style_bg_color(g_mouth, lv_color_hex(0x7BE7FF), 0);
+  } else if (g_renderMode == RENDER_CARTOON) {
+    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_95, 0);
+    lv_obj_set_style_bg_color(g_facePanel, lv_color_hex(0x1A3952), 0);
+    for (int i = 0; i < 6; ++i) {
+      lv_obj_set_style_line_opa(g_wireLines[i], LV_OPA_10, 0);
+    }
+    lv_obj_set_style_bg_color(g_eyeL, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(g_eyeR, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(g_mouth, lv_color_hex(0xFF915A), 0);
+  } else {
+    lv_obj_set_style_bg_opa(g_facePanel, LV_OPA_90, 0);
+    lv_obj_set_style_bg_color(g_facePanel, lv_color_hex(0x17384A), 0);
+    for (int i = 0; i < 6; ++i) {
+      lv_obj_set_style_line_opa(g_wireLines[i], (i % 2 == 0) ? LV_OPA_40 : LV_OPA_18, 0);
+    }
+    lv_obj_set_style_bg_color(g_eyeL, lv_color_hex(0xC2F4FF), 0);
+    lv_obj_set_style_bg_color(g_eyeR, lv_color_hex(0xC2F4FF), 0);
+    lv_obj_set_style_bg_color(g_mouth, lv_color_hex(0x89E7FF), 0);
+  }
 }
 
 static void avatarTimer(lv_timer_t *timer) {
@@ -535,6 +758,29 @@ static void avatarTimer(lv_timer_t *timer) {
   g_lastFrameMs = now;
   g_animTime += (float)dt / 1000.0f;
 
+  if (!g_audioPlaying && !g_listening) {
+    if (g_animHoldUntilMs && now > g_animHoldUntilMs) {
+      g_anim = AVATAR_IDLE;
+      g_animHoldUntilMs = 0;
+    }
+    if (!g_animHoldUntilMs && now > g_nextIdleAnimMs) {
+      long pick = random(0, 3);
+      if (pick == 0) {
+        g_anim = AVATAR_BLINK;
+        g_animHoldUntilMs = now + 220;
+      } else if (pick == 1) {
+        g_anim = AVATAR_HEAD_TILT;
+        g_animHoldUntilMs = now + 900;
+      } else {
+        g_anim = AVATAR_SCAN_SWEEP;
+        g_animHoldUntilMs = now + 1000;
+      }
+      g_nextIdleAnimMs = now + (uint32_t)random(2200, 5200);
+    }
+  } else {
+    g_nextIdleAnimMs = now + 3000;
+  }
+
   updateAvatarFrame();
 
   if (g_listening) {
@@ -545,22 +791,42 @@ static void avatarTimer(lv_timer_t *timer) {
 // ====== Touch PTT ======
 static void pttEvent(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
+  lv_point_t point = {0, 0};
+  lv_indev_t *indev = lv_indev_get_act();
+  if (indev) {
+    lv_indev_get_point(indev, &point);
+  }
   if (code == LV_EVENT_PRESSED) {
-    g_listening = true;
-    g_anim = AVATAR_LISTEN;
-    setStatus("Listening... release to stop");
-    StaticJsonDocument<256> start;
-    start["type"] = "ptt.start";
-    start["agent_id"] = DEFAULT_AGENT_ID;
-    wsSendJson(start);
+    g_touchTracking = true;
+    g_swipeDetected = false;
+    g_listenStarted = false;
+    g_touchStartMs = millis();
+    g_touchStartX = point.x;
+    g_touchStartY = point.y;
+    g_touchEndX = point.x;
+  } else if (code == LV_EVENT_PRESSING) {
+    if (!g_touchTracking) {
+      return;
+    }
+    g_touchEndX = point.x;
+    int dx = point.x - g_touchStartX;
+    int dy = point.y - g_touchStartY;
+    if (!g_listenStarted && abs(dx) > 60 && abs(dx) > abs(dy) + 10) {
+      g_swipeDetected = true;
+      return;
+    }
+    if (!g_swipeDetected && !g_listenStarted && millis() - g_touchStartMs > 180 && abs(dx) < 26 && abs(dy) < 26) {
+      startListening();
+    }
   } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-    g_listening = false;
-    g_anim = AVATAR_IDLE;
-    setStatus("Ready");
-    StaticJsonDocument<256> stop;
-    stop["type"] = "ptt.stop";
-    stop["session_id"] = g_sessionId;
-    wsSendJson(stop);
+    if (g_swipeDetected && !g_listenStarted) {
+      cycleRenderMode((g_touchEndX >= g_touchStartX) ? 1 : -1);
+    } else if (g_listenStarted) {
+      stopListening();
+    }
+    g_touchTracking = false;
+    g_swipeDetected = false;
+    g_listenStarted = false;
   }
 }
 
@@ -603,6 +869,16 @@ static void initAvatarUi() {
   lv_obj_set_style_border_width(g_root, 0, 0);
   lv_obj_set_style_pad_all(g_root, 0, 0);
 
+  lv_style_init(&g_faceStyle);
+  lv_style_set_bg_opa(&g_faceStyle, LV_OPA_80);
+  lv_style_set_radius(&g_faceStyle, 26);
+
+  g_facePanel = lv_obj_create(g_root);
+  lv_obj_add_style(g_facePanel, &g_faceStyle, 0);
+  lv_obj_set_style_border_width(g_facePanel, 0, 0);
+  lv_obj_set_style_shadow_width(g_facePanel, 18, 0);
+  lv_obj_set_style_shadow_opa(g_facePanel, LV_OPA_20, 0);
+
   lv_style_init(&g_lineStyle);
   lv_style_set_line_width(&g_lineStyle, 2);
   lv_style_set_line_color(&g_lineStyle, lv_color_hex(0x28D8FF));
@@ -641,6 +917,7 @@ static void initAvatarUi() {
   lv_obj_add_event_cb(g_pttOverlay, pttEvent, LV_EVENT_ALL, nullptr);
 
   g_lastFrameMs = millis();
+  g_nextIdleAnimMs = millis() + 1800;
   lv_timer_create(avatarTimer, 33, nullptr);
 }
 
@@ -671,6 +948,7 @@ static void setupWifi() {
 
 void setup() {
   Serial.begin(115200);
+  randomSeed(micros());
 
   g_wsMutex = xSemaphoreCreateMutex();
 

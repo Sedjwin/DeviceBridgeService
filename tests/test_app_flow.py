@@ -164,13 +164,22 @@ def test_large_audio_uses_url_delivery() -> None:
                 def post_audio() -> None:
                     result_holder["response"] = client.post(
                         f"/api/sessions/{session_id}/agent-audio",
-                        json={"audio_base64": audio_b64, "sample_rate": 22050},
+                        json={
+                            "audio_base64": audio_b64,
+                            "sample_rate": 22050,
+                            "visemes": [
+                                {"t": 0, "type": "viseme", "value": 3},
+                                {"t": 95, "type": "viseme", "value": 7},
+                            ],
+                        },
                     )
 
                 thread = threading.Thread(target=post_audio)
                 thread.start()
                 cmd = ws.receive_json()
                 assert cmd["type"] == "audio.play_url"
+                assert cmd["payload"]["sample_rate"] == 22050
+                assert cmd["payload"]["visemes"] == [{"t": 0, "value": 3}, {"t": 95, "value": 7}]
                 download = client.get(cmd["payload"]["url"].replace(settings.public_base_url, ""))
                 assert download.status_code == 200
                 assert download.content == audio_bytes
