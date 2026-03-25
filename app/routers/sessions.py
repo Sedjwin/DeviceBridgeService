@@ -108,17 +108,32 @@ def _wav_resample(audio_bytes: bytes, target_rate: int | None) -> tuple[bytes, i
         return audio_bytes, None
 
 
-def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sample_rate: int | None) -> tuple[str, dict, int]:
+def _wav_to_pcm(audio_bytes: bytes) -> tuple[bytes, int | None]:
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            source_rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+        if channels != 1 or sampwidth != 2:
+            return b"", source_rate
+        return frames, source_rate
+    except Exception:
+        return b"", None
+
+
+def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sample_rate: int | None) -> dict:
     caps = store.device_capabilities_dict(device)
     audio_bytes = base64.b64decode(audio_base64)
     target_rate = _choose_sample_rate(caps, sample_rate)
     adapted_bytes, adapted_rate = _wav_resample(audio_bytes, target_rate)
     adapted_b64 = base64.b64encode(adapted_bytes).decode("ascii")
     audio_path, audio_size = _materialize_audio_output(device.device_id, session_id, adapted_b64)
+    pcm_bytes, pcm_rate = _wav_to_pcm(adapted_bytes)
 
     methods = [str(x).strip().lower() for x in caps.get("audio_methods", []) if str(x).strip()]
     if not methods:
-        methods = ["inline", "url"]
+        methods = ["inline", "url", "ws_stream"]
     preferred_method = str(caps.get("preferred_audio_method", "") or "").strip().lower()
     max_inline_audio_bytes = caps.get("max_inline_audio_bytes")
     try:
@@ -126,24 +141,36 @@ def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sa
     except (TypeError, ValueError):
         inline_limit = settings.device_inline_audio_max_bytes
 
+    if "ws_stream" in methods and pcm_bytes and preferred_method in {"ws_stream", "stream", ""}:
+        return {
+            "command_type": "audio.stream",
+            "sample_rate": pcm_rate or adapted_rate or sample_rate,
+            "audio_size": len(pcm_bytes),
+            "audio_path": audio_path,
+            "pcm_bytes": pcm_bytes,
+            "prebuffer_ms": int(caps.get("stream_prebuffer_ms") or 250),
+            "chunk_bytes": 4096,
+        }
+
     use_inline = "inline" in methods and audio_size <= inline_limit and (
         preferred_method == "inline" or "url" not in methods
     )
     if use_inline:
-        return (
-            "audio.play",
-            {
+        return {
+            "command_type": "audio.play",
+            "command_payload": {
                 "session_id": session_id,
                 "audio_base64": adapted_b64,
                 "sample_rate": adapted_rate or sample_rate,
             },
-            audio_size,
-        )
+            "audio_size": audio_size,
+            "audio_path": audio_path,
+        }
 
     relative_path = f"/api/device/sessions/{session_id}/audio/{audio_path.name}"
-    return (
-        "audio.play_url",
-        {
+    return {
+        "command_type": "audio.play_url",
+        "command_payload": {
             "session_id": session_id,
             "url": f"{settings.public_base_url.rstrip('/')}{relative_path}",
             "path": relative_path,
@@ -152,8 +179,9 @@ def _prepare_device_audio(device: Device, session_id: str, audio_base64: str, sa
             "bytes": audio_size,
             "prebuffer_ms": caps.get("stream_prebuffer_ms"),
         },
-        audio_size,
-    )
+        "audio_size": audio_size,
+        "audio_path": audio_path,
+    }
 
 
 def _compress_visemes(timeline: list) -> list[dict]:
@@ -216,16 +244,64 @@ async def post_agent_audio(session_id: str, payload: AgentAudioIn, db: AsyncSess
         raise HTTPException(status_code=404, detail="device not found")
 
     await _emit_debug(session_id, "audio_start", {"bytes_b64": len(payload.audio_base64)})
-    command_type, command_payload, audio_size = _prepare_device_audio(device, session_id, payload.audio_base64, payload.sample_rate)
-    command_payload["visemes"] = _compress_visemes(payload.visemes)
-    audio_path = DATA_ROOT / row.device_id / "sessions" / session_id / "audio_out" / "reply.wav"
+    prepared = _prepare_device_audio(device, session_id, payload.audio_base64, payload.sample_rate)
+    command_type = str(prepared["command_type"])
+    audio_size = int(prepared["audio_size"])
+    audio_path = prepared["audio_path"]
+    visemes = _compress_visemes(payload.visemes)
 
-    command_id = await hub.dispatch_command(
-        row.device_id,
-        command_type,
-        command_payload,
-        require_ack=False,
-    )
+    if command_type == "audio.stream":
+        pcm_bytes = prepared["pcm_bytes"]
+        chunk_bytes = int(prepared.get("chunk_bytes") or 4096)
+        sample_rate_out = int(prepared.get("sample_rate") or payload.sample_rate or 16000)
+        prebuffer_ms = int(prepared.get("prebuffer_ms") or 250)
+        total_chunks = max(1, (len(pcm_bytes) + chunk_bytes - 1) // chunk_bytes)
+        stream_id = await hub.dispatch_command(
+            row.device_id,
+            "audio.stream.start",
+            {
+                "session_id": session_id,
+                "sample_rate": sample_rate_out,
+                "channels": 1,
+                "format": "pcm_s16le",
+                "bytes": len(pcm_bytes),
+                "chunk_bytes": chunk_bytes,
+                "prebuffer_ms": prebuffer_ms,
+                "visemes": visemes,
+                "total_chunks": total_chunks,
+            },
+            require_ack=False,
+        )
+        for seq, offset in enumerate(range(0, len(pcm_bytes), chunk_bytes)):
+            chunk = pcm_bytes[offset : offset + chunk_bytes]
+            await hub.dispatch_command(
+                row.device_id,
+                "audio.stream.chunk",
+                {
+                    "session_id": session_id,
+                    "seq": seq,
+                    "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                },
+                require_ack=False,
+            )
+            if seq % 4 == 3:
+                await asyncio.sleep(0.005)
+        await hub.dispatch_command(
+            row.device_id,
+            "audio.stream.end",
+            {"session_id": session_id, "total_chunks": total_chunks},
+            require_ack=False,
+        )
+        command_id = stream_id
+    else:
+        command_payload = dict(prepared["command_payload"])
+        command_payload["visemes"] = visemes
+        command_id = await hub.dispatch_command(
+            row.device_id,
+            command_type,
+            command_payload,
+            require_ack=False,
+        )
     await store.add_session_event(
         db,
         session_id=session_id,

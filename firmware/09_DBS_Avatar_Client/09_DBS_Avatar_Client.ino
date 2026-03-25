@@ -13,7 +13,7 @@
 #include "src/audio_bsp/user_audio.h"
 
 // Build ID:
-// DBS_AVATAR_2026_03_25_1839
+// DBS_AVATAR_2026_03_25_1848
 
 // ====== USER CONFIG ======
 static const char *WIFI_SSID = "2xD_WiFi";
@@ -24,7 +24,7 @@ static const char *DBS_HOST = "chip.iampc.uk";
 static const uint16_t DBS_PORT = 13382;
 static const char *DEVICE_ID = "waveshare-esp32s3-amoled-01";
 static const char *DEFAULT_AGENT_ID = "";
-static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1839";
+static const char *FIRMWARE_VERSION = "DBS_AVATAR_2026_03_25_1848";
 
 // If you run DBS on local plain HTTP, set DBS_USE_SSL=false and use port 8011.
 
@@ -94,6 +94,17 @@ static uint32_t g_animHoldUntilMs = 0;
 static uint32_t g_nextIdleAnimMs = 0;
 static uint32_t g_playbackSampleRate = 16000;
 static String g_lastError = "";
+static SemaphoreHandle_t g_audioBufMutex = nullptr;
+static uint8_t *g_streamBuf = nullptr;
+static size_t g_streamBufCap = 65536;
+static size_t g_streamReadPos = 0;
+static size_t g_streamWritePos = 0;
+static size_t g_streamBuffered = 0;
+static uint32_t g_streamPrebufferBytes = 16000;
+static volatile bool g_streamActive = false;
+static volatile bool g_streamEnded = false;
+static volatile bool g_streamStartedPlayback = false;
+static volatile uint32_t g_streamBytesPlayed = 0;
 
 #if LVGL_VERSION_MAJOR >= 9
 static lv_point_precise_t g_poly0[2];
@@ -124,6 +135,72 @@ static bool wsSendJson(const JsonDocument &doc) {
   bool ok = g_ws.sendTXT(payload);
   xSemaphoreGive(g_wsMutex);
   return ok;
+}
+
+static size_t streamBufAvailable() {
+  size_t available = 0;
+  if (g_audioBufMutex && xSemaphoreTake(g_audioBufMutex, pdMS_TO_TICKS(20))) {
+    available = g_streamBuffered;
+    xSemaphoreGive(g_audioBufMutex);
+  }
+  return available;
+}
+
+static void resetStreamState() {
+  if (g_audioBufMutex && xSemaphoreTake(g_audioBufMutex, pdMS_TO_TICKS(50))) {
+    g_streamReadPos = 0;
+    g_streamWritePos = 0;
+    g_streamBuffered = 0;
+    xSemaphoreGive(g_audioBufMutex);
+  }
+  g_streamActive = false;
+  g_streamEnded = false;
+  g_streamStartedPlayback = false;
+  g_streamBytesPlayed = 0;
+}
+
+static bool streamBufWrite(const uint8_t *data, size_t len) {
+  if (!data || len == 0 || !g_streamBuf || !g_audioBufMutex) {
+    return false;
+  }
+  if (!xSemaphoreTake(g_audioBufMutex, pdMS_TO_TICKS(50))) {
+    return false;
+  }
+  bool ok = (len <= (g_streamBufCap - g_streamBuffered));
+  if (ok) {
+    size_t first = min(len, g_streamBufCap - g_streamWritePos);
+    memcpy(g_streamBuf + g_streamWritePos, data, first);
+    size_t remaining = len - first;
+    if (remaining > 0) {
+      memcpy(g_streamBuf, data + first, remaining);
+    }
+    g_streamWritePos = (g_streamWritePos + len) % g_streamBufCap;
+    g_streamBuffered += len;
+  }
+  xSemaphoreGive(g_audioBufMutex);
+  return ok;
+}
+
+static size_t streamBufRead(uint8_t *out, size_t len) {
+  if (!out || len == 0 || !g_streamBuf || !g_audioBufMutex) {
+    return 0;
+  }
+  if (!xSemaphoreTake(g_audioBufMutex, pdMS_TO_TICKS(50))) {
+    return 0;
+  }
+  size_t n = min(len, g_streamBuffered);
+  if (n > 0) {
+    size_t first = min(n, g_streamBufCap - g_streamReadPos);
+    memcpy(out, g_streamBuf + g_streamReadPos, first);
+    size_t remaining = n - first;
+    if (remaining > 0) {
+      memcpy(out + first, g_streamBuf, remaining);
+    }
+    g_streamReadPos = (g_streamReadPos + n) % g_streamBufCap;
+    g_streamBuffered -= n;
+  }
+  xSemaphoreGive(g_audioBufMutex);
+  return n;
 }
 
 static String base64Encode(const uint8_t *data, size_t len) {
@@ -277,6 +354,7 @@ static void endPlayback() {
   g_anim = AVATAR_IDLE;
   setOutputSampleRate(16000);
   setStatus("Ready");
+  g_streamStartedPlayback = false;
 }
 
 static void startListening() {
@@ -328,6 +406,7 @@ static void sendHello() {
   JsonArray audioCodecs = caps.createNestedArray("audio_codecs");
   audioCodecs.add("wav");
   JsonArray audioMethods = caps.createNestedArray("audio_methods");
+  audioMethods.add("ws_stream");
   audioMethods.add("inline");
   audioMethods.add("url");
   JsonArray sampleRates = caps.createNestedArray("sample_rates");
@@ -335,7 +414,7 @@ static void sendHello() {
   sampleRates.add(22050);
   sampleRates.add(24000);
   caps["preferred_sample_rate"] = 22050;
-  caps["preferred_audio_method"] = "inline";
+  caps["preferred_audio_method"] = "ws_stream";
   caps["max_inline_audio_bytes"] = 262144;
   caps["stream_prebuffer_ms"] = 350;
 
@@ -633,6 +712,62 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         return;
       }
 
+      if (strcmp(msgType, "audio.stream.start") == 0) {
+        const char *sessionId = doc["payload"]["session_id"] | "";
+        uint32_t sampleRate = (uint32_t)(doc["payload"]["sample_rate"] | 16000);
+        uint32_t prebufferMs = (uint32_t)(doc["payload"]["prebuffer_ms"] | 250);
+        g_sessionId = String(sessionId);
+        loadVisemes(doc["payload"]["visemes"]);
+        resetStreamState();
+        setOutputSampleRate(sampleRate);
+        uint32_t wanted = (uint32_t)(((uint64_t)g_playbackSampleRate * 2ULL * (uint64_t)prebufferMs) / 1000ULL);
+        if (wanted < 4096) {
+          wanted = 4096;
+        }
+        if (wanted > (uint32_t)(g_streamBufCap / 2)) {
+          wanted = (uint32_t)(g_streamBufCap / 2);
+        }
+        g_streamPrebufferBytes = wanted;
+        g_streamActive = true;
+        g_streamEnded = false;
+        setStatus("Buffering voice...");
+        g_lastError = "";
+        sendAck(commandId, true);
+        return;
+      }
+
+      if (strcmp(msgType, "audio.stream.chunk") == 0) {
+        const char *audioB64 = doc["payload"]["audio_base64"] | "";
+        if (strlen(audioB64) == 0) {
+          sendAck(commandId, false, "empty stream chunk");
+          return;
+        }
+        uint8_t *pcm = nullptr;
+        size_t pcmLen = 0;
+        if (!base64Decode(audioB64, &pcm, &pcmLen)) {
+          g_lastError = "audio_stream_decode_failed";
+          sendDeviceLog("error", "Audio stream decode failed", g_lastError.c_str());
+          sendAck(commandId, false, "stream decode failed");
+          return;
+        }
+        bool ok = streamBufWrite(pcm, pcmLen);
+        free(pcm);
+        if (!ok) {
+          g_lastError = "audio_stream_overflow";
+          sendDeviceLog("error", "Audio stream buffer overflow", g_lastError.c_str());
+          sendAck(commandId, false, "stream buffer overflow");
+        } else {
+          sendAck(commandId, true);
+        }
+        return;
+      }
+
+      if (strcmp(msgType, "audio.stream.end") == 0) {
+        g_streamEnded = true;
+        sendAck(commandId, true);
+        return;
+      }
+
       if (strcmp(msgType, "audio.play_url") == 0) {
         const char *sessionId = doc["payload"]["session_id"] | "";
         const char *url = doc["payload"]["url"] | "";
@@ -906,6 +1041,47 @@ static void micTask(void *arg) {
   }
 }
 
+static void audioStreamTask(void *arg) {
+  (void)arg;
+  static uint8_t outBuf[1024];
+
+  for (;;) {
+    if (!g_streamActive) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    size_t buffered = streamBufAvailable();
+    if (!g_streamStartedPlayback) {
+      if (buffered >= g_streamPrebufferBytes || (g_streamEnded && buffered > 0)) {
+        beginPlayback(g_playbackSampleRate);
+        g_streamStartedPlayback = true;
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+    }
+
+    size_t got = streamBufRead(outBuf, sizeof(outBuf));
+    if (got > 0) {
+      uint32_t elapsedMs = (uint32_t)(((uint64_t)g_streamBytesPlayed * 1000ULL) / (2ULL * (uint64_t)g_playbackSampleRate));
+      updateVisemeProgress(elapsedMs);
+      g_audio->I2sAudio_PlayWrite(outBuf, got);
+      g_streamBytesPlayed += (uint32_t)got;
+      continue;
+    }
+
+    if (g_streamEnded) {
+      endPlayback();
+      resetStreamState();
+      g_lastError = "";
+      continue;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(8));
+  }
+}
+
 static void initAvatarUi() {
   g_root = lv_obj_create(lv_scr_act());
   lv_obj_set_size(g_root, LCD_H_RES, LCD_V_RES);
@@ -1002,6 +1178,11 @@ void setup() {
   Serial.println(DBS_PORT);
 
   g_wsMutex = xSemaphoreCreateMutex();
+  g_audioBufMutex = xSemaphoreCreateMutex();
+  g_streamBuf = (uint8_t *)heap_caps_malloc(g_streamBufCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!g_streamBuf) {
+    g_streamBuf = (uint8_t *)malloc(g_streamBufCap);
+  }
 
   g_audio = new I2sAudioCodec("S3_AMOLED_1_32");
   g_audio->I2sAudio_SetMicGain(20);
@@ -1023,6 +1204,7 @@ void setup() {
   }
 
   xTaskCreatePinnedToCore(micTask, "micTask", 6 * 1024, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(audioStreamTask, "audioStreamTask", 6 * 1024, nullptr, 2, nullptr, 1);
 }
 
 void loop() {
