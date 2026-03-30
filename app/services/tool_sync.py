@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.models import Device, DeviceCapability
@@ -68,10 +69,13 @@ async def sync_device_to_toolgateway(
     synced = 0
     failed = 0
 
-    result = await db.execute(
-        select(DeviceCapability).where(DeviceCapability.device_id == device.device_id)
+    # Re-load device with capabilities (avoid lazy loading)
+    from app.models import Device as DeviceModel
+    dev_result = await db.execute(
+        select(DeviceModel).options(selectinload(DeviceModel.capabilities)).where(DeviceModel.device_id == device.device_id)
     )
-    caps = result.scalars().all()
+    device = dev_result.scalar_one()
+    caps = device.capabilities
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         # Fetch existing tools so we can upsert
@@ -157,7 +161,8 @@ async def retire_device_tools(device: Device) -> int:
     retired = 0
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for cap in device.capabilities:
+        caps = list(device.capabilities) if hasattr(device, '_sa_instance_state') else []
+        for cap in caps:
             if not cap.tg_tool_id:
                 continue
             try:

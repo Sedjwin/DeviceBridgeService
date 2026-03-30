@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.auth import get_admin_principal
 from app.database import get_db
@@ -85,7 +86,9 @@ def _parse_manifest(body: DeviceRegister) -> tuple[str, str, str, str, str, dict
 
 @router.get("", response_model=list[DeviceListItem])
 async def list_devices(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Device).order_by(Device.created_at.desc()))
+    result = await db.execute(
+        select(Device).options(selectinload(Device.capabilities)).order_by(Device.created_at.desc())
+    )
     devices = result.scalars().all()
     items = []
     for d in devices:
@@ -166,7 +169,6 @@ async def register_device(
         db.add(cap)
 
     await db.commit()
-    await db.refresh(device)
 
     # Ping to set initial status
     try:
@@ -181,14 +183,22 @@ async def register_device(
 
     # Sync capabilities → ToolGateway
     synced, failed = await sync_device_to_toolgateway(db, device)
-    await db.refresh(device)
     logger.info("DBS: registered device '%s' slug=%s synced=%d failed=%d", name, slug, synced, failed)
+
+    # Reload with relationships for response
+    result2 = await db.execute(
+        select(Device).options(selectinload(Device.capabilities)).where(Device.device_id == device.device_id)
+    )
+    device = result2.scalar_one()
     return _device_out(device)
 
 
 @router.get("/{device_id}", response_model=DeviceOut)
 async def get_device(device_id: str, db: AsyncSession = Depends(get_db)):
-    d = await db.get(Device, device_id)
+    result = await db.execute(
+        select(Device).options(selectinload(Device.capabilities)).where(Device.device_id == device_id)
+    )
+    d = result.scalar_one_or_none()
     if not d:
         raise HTTPException(404, "Device not found")
     return _device_out(d)
@@ -201,7 +211,8 @@ async def update_device(
     principal: dict = Depends(get_admin_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    d = await db.get(Device, device_id)
+    result = await db.execute(select(Device).options(selectinload(Device.capabilities)).where(Device.device_id == device_id))
+    d = result.scalar_one_or_none()
     if not d:
         raise HTTPException(404, "Device not found")
 
@@ -219,7 +230,8 @@ async def update_device(
         d.input_json = json.dumps(body.input)
 
     await db.commit()
-    await db.refresh(d)
+    result3 = await db.execute(select(Device).options(selectinload(Device.capabilities)).where(Device.device_id == device_id))
+    d = result3.scalar_one()
     return _device_out(d)
 
 
@@ -229,7 +241,8 @@ async def delete_device(
     principal: dict = Depends(get_admin_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    d = await db.get(Device, device_id)
+    result = await db.execute(select(Device).options(selectinload(Device.capabilities)).where(Device.device_id == device_id))
+    d = result.scalar_one_or_none()
     if not d:
         raise HTTPException(404, "Device not found")
 
@@ -244,7 +257,8 @@ async def ping_device(
     device_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    d = await db.get(Device, device_id)
+    result = await db.execute(select(Device).where(Device.device_id == device_id))
+    d = result.scalar_one_or_none()
     if not d:
         raise HTTPException(404, "Device not found")
 
@@ -267,7 +281,8 @@ async def sync_device(
     db: AsyncSession = Depends(get_db),
 ):
     """Re-sync all capabilities to ToolGateway (idempotent)."""
-    d = await db.get(Device, device_id)
+    result = await db.execute(select(Device).options(selectinload(Device.capabilities)).where(Device.device_id == device_id))
+    d = result.scalar_one_or_none()
     if not d:
         raise HTTPException(404, "Device not found")
 
@@ -285,7 +300,8 @@ async def test_capability(
 ):
     """Admin test endpoint — execute a capability directly without going through ToolGateway."""
     import time as _time
-    d = await db.get(Device, device_id)
+    result = await db.execute(select(Device).where(Device.device_id == device_id))
+    d = result.scalar_one_or_none()
     if not d:
         raise HTTPException(404, "Device not found")
 
