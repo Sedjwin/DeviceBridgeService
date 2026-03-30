@@ -1,0 +1,17 @@
+[Unit]
+Description=DeviceBridgeService — hardware abstraction layer for AI agents
+After=network.target
+
+[Service]
+Type=simple
+User=sedjwin
+WorkingDirectory=/home/sedjwin/DeviceBridgeService
+EnvironmentFile=/home/sedjwin/DeviceBridgeService/.env
+ExecStart=/home/sedjwin/DeviceBridgeService/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8010
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
