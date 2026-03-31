@@ -16,8 +16,12 @@ from app.adapters.base import DeviceAdapter
 
 # ── WLED DNRGB protocol constants ─────────────────────────────────────────────
 _DNRGB_PROTOCOL  = 4      # DNRGB: offset + RGB data
-_CHUNK_SIZE      = 256    # 256 LEDs per UDP packet (~772 bytes, well within MTU)
 _TIMEOUT_SECS    = 3      # WLED reverts to normal after this many seconds of no packets
+# Max LEDs per UDP packet: 1472 (UDP payload limit) - 4 (DNRGB header) = 1468 bytes / 3 = 489 LEDs.
+# Using 489 keeps packets within standard MTU and sends 9 packets for a 64×64 matrix
+# instead of 16 (with the old 256 limit), reducing the inter-packet window WLED
+# can refresh within.
+_CHUNK_SIZE      = 489
 
 
 class WLEDAdapter(DeviceAdapter):
@@ -172,43 +176,58 @@ class WLEDAdapter(DeviceAdapter):
         body = {"on": True, "bri": 0, "seg": [{"col": [[0, 0, 0]]}]}
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(f"{self._base_url}/json/state", json=body)
-        # Also send a black UDP frame to instantly clear
+        # Also send a black DNRGB frame to instantly clear
         pixels = [(0, 0, 0)] * (self.width * self.height)
         await asyncio.get_event_loop().run_in_executor(
             None, self._send_frame_udp, pixels
         )
         return {"ok": r.status_code < 300}
 
-    # ── UDP helpers ───────────────────────────────────────────────────────────
+    # ── DNRGB UDP helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_dnrgb_packets(pixels: list[tuple[int, int, int]]) -> list[bytes]:
+        """
+        Pre-build all DNRGB packets for a frame as a list of bytes objects.
+        Building upfront means the send loop contains only sendto() calls —
+        no Python computation between sends — which minimises the inter-packet
+        gap that WLED can fire a refresh within.
+        """
+        packets = []
+        for start in range(0, len(pixels), _CHUNK_SIZE):
+            chunk = pixels[start:start + _CHUNK_SIZE]
+            data  = bytearray([_DNRGB_PROTOCOL, _TIMEOUT_SECS, (start >> 8) & 0xFF, start & 0xFF])
+            for r, g, b in chunk:
+                data.extend((r, g, b))
+            packets.append(bytes(data))
+        return packets
 
     def _send_frame_udp(self, pixels: list[tuple[int, int, int]]) -> None:
         """Send a single frame via WLED DNRGB UDP protocol."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        packets = self._build_dnrgb_packets(pixels)
+        addr    = (self.host, self.udp_port)
+        sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, len(packets) * 1500)
         try:
-            for start in range(0, len(pixels), _CHUNK_SIZE):
-                chunk = pixels[start:start + _CHUNK_SIZE]
-                high  = (start >> 8) & 0xFF
-                low   =  start       & 0xFF
-                data  = bytearray([_DNRGB_PROTOCOL, _TIMEOUT_SECS, high, low])
-                for r, g, b in chunk:
-                    data += bytes([r, g, b])
-                sock.sendto(bytes(data), (self.host, self.udp_port))
+            for pkt in packets:
+                sock.sendto(pkt, addr)
         finally:
             sock.close()
 
     def _send_frames_udp(self, frames: list[list[tuple[int, int, int]]], frame_delay: float) -> None:
-        """Send multiple frames with a delay between each."""
+        """
+        Send multiple frames via DNRGB with a delay between each.
+        All packet data is pre-built before the send loop starts so that
+        per-frame bursts contain no Python overhead between sendto() calls.
+        """
+        all_frame_packets = [self._build_dnrgb_packets(pixels) for pixels in frames]
+        addr = (self.host, self.udp_port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 9 * 1500)
         try:
-            for pixels in frames:
-                for start in range(0, len(pixels), _CHUNK_SIZE):
-                    chunk = pixels[start:start + _CHUNK_SIZE]
-                    high  = (start >> 8) & 0xFF
-                    low   =  start       & 0xFF
-                    data  = bytearray([_DNRGB_PROTOCOL, _TIMEOUT_SECS, high, low])
-                    for r, g, b in chunk:
-                        data += bytes([r, g, b])
-                    sock.sendto(bytes(data), (self.host, self.udp_port))
+            for packets in all_frame_packets:
+                for pkt in packets:
+                    sock.sendto(pkt, addr)
                 time.sleep(frame_delay)
         finally:
             sock.close()
@@ -234,6 +253,7 @@ def _decode_image_to_pixels(
     raw = base64.b64decode(image_b64)
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     img = img.resize((width, height), Image.LANCZOS)
+    img = img.transpose(Image.FLIP_LEFT_RIGHT)
     return list(img.getdata())
 
 
@@ -260,6 +280,7 @@ def _render_static_text(
     x = (width  - tw) // 2
     y = (height - th) // 2
     draw.text((x, y), text, fill=color, font=font)
+    img = img.transpose(Image.FLIP_LEFT_RIGHT)
     return list(img.getdata())
 
 
@@ -291,9 +312,10 @@ def _render_scrolling_text(
     draw   = ImageDraw.Draw(canvas)
     y = (height - th) // 2
     draw.text((width, y), text, fill=color, font=font)
+    canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
 
     frames = []
-    for x in range(canvas_w - width + 1):
+    for x in range(canvas_w - width, -1, -1):
         crop   = canvas.crop((x, 0, x + width, height))
         frames.append(list(crop.getdata()))
     return frames
