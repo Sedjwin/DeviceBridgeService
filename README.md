@@ -228,8 +228,3 @@ sudo cp devicebridgeservice.service /etc/systemd/system/
 sudo systemctl enable --now devicebridgeservice.service
 ```
 
----
-
-## Embodiment Extension
-
-See `embodimentplan.md` for the planned extension turning DBS into a full embodiment orchestrator — covering device groups, embodiment sessions with Z-index preemption and permission plans, canonical `embody.*` ToolGateway tools, bidirectional audio streaming, and avatar delivery tiers.
