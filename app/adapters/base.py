@@ -15,6 +15,8 @@ class DeviceAdapter(ABC):
         self.host = host
         self.connection = connection
 
+    # ── Core (must implement) ──────────────────────────────────────────────────
+
     @abstractmethod
     async def ping(self) -> tuple[bool, float | None, dict[str, Any]]:
         """
@@ -29,6 +31,8 @@ class DeviceAdapter(ABC):
         Returns a result dict. Raises on failure.
         """
 
+    # ── Optional discovery ─────────────────────────────────────────────────────
+
     async def fetch_live_manifest(self) -> dict[str, Any] | None:
         """
         Optionally fetch a live capability manifest from the device itself.
@@ -36,11 +40,53 @@ class DeviceAdapter(ABC):
         """
         return None
 
+    # ── Audio (optional) ───────────────────────────────────────────────────────
+
     async def stream_audio_to_device(self, wav_bytes: bytes, sample_rate: int) -> None:
-        """Send audio to the device (devices with speaker support)."""
+        """Send TTS audio to the device speaker."""
         raise NotImplementedError(f"{self.__class__.__name__} does not support audio output")
 
     async def stream_audio_from_device(self) -> AsyncIterator[bytes]:
-        """Receive audio from the device (devices with mic support)."""
+        """Receive audio from the device mic."""
         raise NotImplementedError(f"{self.__class__.__name__} does not support audio input")
-        yield  # make it a generator
+        yield  # make it an async generator
+
+    # ── Embodiment lifecycle (optional) ───────────────────────────────────────
+
+    async def setup_embodiment_session(
+        self,
+        session_id: str,
+        manifest: dict[str, Any],
+        character_vars: dict[str, Any] | None,
+    ) -> None:
+        """
+        Called when an embodiment session starts on this device.
+        Establish transport, send initial character vars if supported.
+        Default: no-op.
+        """
+
+    async def teardown_embodiment_session(self, session_id: str) -> None:
+        """
+        Called when a session is released or transferred away from this device.
+        Default: no-op.
+        """
+
+    async def push_device_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """
+        Push runtime settings to the device (e.g. silence_timeout_ms, wake_word).
+        Returns {"ok": True} on success. Raises on failure.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support settings push"
+        )
+
+    async def push_expression(
+        self,
+        expression: str,
+        character_vars: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Send an expression/emotion state to the device display.
+        For variable_render devices, character_vars may carry per-emotion render params.
+        Default: no-op (not all devices support avatar expressions).
+        """

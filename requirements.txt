@@ -9,3 +9,8 @@ Pillow
 numpy
 python-multipart
 python-dotenv
+
+# Testing
+pytest
+pytest-asyncio
+respx

@@ -6,11 +6,15 @@ from typing import Any
 from app.adapters.base import DeviceAdapter
 from app.adapters.wled import WLEDAdapter
 from app.adapters.http_device import HTTPDeviceAdapter
+from app.adapters.esp import ESPHTTPAdapter, ESPWSAdapter
 
 _ADAPTER_MAP: dict[str, type[DeviceAdapter]] = {
     "wled":      WLEDAdapter,
     "http_rest": HTTPDeviceAdapter,
     "pi_bridge": HTTPDeviceAdapter,  # Pi bridge uses same HTTP REST interface
+    # ESP adapters — stubs until hardware spec is confirmed
+    "esp_http":  ESPHTTPAdapter,
+    "esp_ws":    ESPWSAdapter,
 }
 
 
