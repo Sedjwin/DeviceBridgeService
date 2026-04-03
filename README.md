@@ -1,19 +1,26 @@
 # DeviceBridgeService
 
-Hardware abstraction layer for the AI infrastructure stack. Registers physical and virtual devices, manages capability manifests, bridges audio between devices and VoiceService, tracks agent presence on devices, and syncs device capabilities to ToolGateway as executable tools.
+Physical embodiment orchestrator and hardware abstraction layer for the AI infrastructure stack. Agents claim devices through an *embodiment session*, then use a canonical `embody.*` interface that DBS translates into device-specific commands. Lower-level `device.*` tools remain available for direct admin/debug use.
 
+**Version:** 2.0.0  
 **Ports:** `8010` (internal) / `13381` (external, HTTPS via Caddy)
 
 ---
 
 ## Overview
 
-- **Device registry** — register devices by protocol (WLED, HTTP, WebSocket, etc.) with capability manifests
-- **Capability sync** — auto-registers device capabilities as `device.{slug}.{capability}` tools in ToolGateway
-- **Execution bridge** — receives tool calls from ToolGateway and dispatches them to device adapters
-- **Audio bridge** — routes TTS (VoiceService → device speaker) and STT (device mic → VoiceService) per device
-- **Presence tracking** — records which agent session is active on which device
-- **Embodiment (planned)** — see `embodimentplan.md` for the full extension roadmap
+- **Device registry** — register devices by protocol with structured capability and embodiment manifests
+- **Embodiment sessions** — agents claim primary devices, hold multi-device sessions, move between devices without interrupting conversations
+- **Preemption** — z-index priority system; higher-priority sessions displace lower ones
+- **Canonical interface** — `embody.*` tools registered in ToolGateway; DBS routes them to device adapters
+- **WebSocket audio stream** — real-time STT → AgentManager → TTS pipeline per session
+- **HTTP audio upload** — synchronous fallback for non-WebSocket devices
+- **Avatar delivery** — dispatches character vars (`variable_render`) or expression strings (`simple_sprite`) based on device manifest
+- **Device groups** — group devices by location; wake-word events auto-create embodiment sessions for the group's default agent
+- **Device events** — wake-word / button-press routing from devices to sessions
+- **Capability sync** — auto-registers `device.{slug}.{capability}` tools in ToolGateway on device registration
+- **Timeout task** — background sweep releases expired `timeout`-plan sessions every 30 s
+- **Presence tracking** — legacy `DevicePresence` kept; superseded by `EmbodimentSession`
 
 ---
 
@@ -41,28 +48,73 @@ Each device has:
 | Field | Description |
 |-------|-------------|
 | `slug` | Unique identifier used in tool names and URL paths |
-| `protocol` | `wled` \| `http_rest` \| `pi_bridge` \| `websocket` |
+| `protocol` | `wled` \| `http_rest` \| `pi_bridge` \| `websocket` \| `esp_http` \| `esp_ws` |
 | `host` | IP address or hostname |
 | `connection_json` | Protocol-specific settings (ports, dimensions, etc.) |
-| `manifest_json` | Full capability manifest; auto-fetched for WLED if not provided |
+| `manifest_json` | Full capability manifest; auto-fetched for WLED |
+| `embodiment_manifest_json` | Embodiment capabilities: audio I/O transport, avatar type, display, settings_writable |
 | `display_json` | Display metadata `{width, height, type, max_fps}` |
 | `audio_json` | Audio metadata `{has_mic, has_speaker, sample_rate, format}` |
 | `input_json` | Input metadata `{has_keyboard, has_button}` |
 | `status` | `online` \| `offline` \| `unknown` — updated on ping |
 
+### Embodiment Manifest Structure
+
+```json
+{
+  "audio_input": {
+    "transport": "websocket_stream | http_upload | wake_word | push_to_talk | button | null",
+    "wake_word": "chef",
+    "silence_timeout_ms": 2000,
+    "sample_rate": 16000,
+    "format": "pcm_s16le",
+    "configurable": ["silence_timeout_ms", "wake_word"]
+  },
+  "audio_output": {
+    "transport": "websocket_stream | http_push | url_pull | null",
+    "sample_rate": 22050
+  },
+  "avatar": {
+    "type": "variable_render | simple_sprite | agent_controlled | none",
+    "expression_states": ["neutral", "happy", "thinking", "listening", "speaking"]
+  },
+  "display": {
+    "width": 320,
+    "height": 240,
+    "type": "tft | oled | epaper | rgb_matrix | none"
+  },
+  "camera": { "supported": false },
+  "settings_writable": ["silence_timeout_ms", "wake_word"]
+}
+```
+
 ---
 
-## Tool Naming
+## Embodiment Sessions
 
-Device capabilities sync to ToolGateway using dotted namespacing:
+An embodiment session ties an agent conversation to one or more physical devices.
+
+### Session States
 
 ```
-device.{slug}.{capability}
+streaming  — active; audio loop running
+ambient    — display held; audio loop paused (resumes on device event)
+released   — terminated; all device links inactive
 ```
 
-Examples: `device.led-matrix-01.display_text`, `device.kitchen-speaker.play_stream`
+### Permission Plans
 
-Sync is triggered on device registration (`POST /api/devices`) and manually via `POST /api/devices/{id}/sync`. On device deletion, all synced tools are retired from ToolGateway.
+| Plan | Behaviour |
+|------|-----------|
+| `active` | Holds until explicitly released |
+| `ambient` | Holds display; audio paused |
+| `timeout` | Auto-released after `timeout_seconds` |
+
+### Preemption (z_index)
+
+- New Z > existing Z → existing session released, new session created
+- New Z < existing Z → 409 `device_occupied` returned
+- Equal Z → latest wins
 
 ---
 
@@ -72,34 +124,22 @@ Each protocol has an adapter in `app/adapters/`. Adapters implement:
 
 - `ping()` → `(online, latency_ms, info_dict)`
 - `execute(capability, payload)` → result dict
-- `fetch_live_manifest()` → capability manifest (optional; WLED auto-detects from `/json/info`)
+- `fetch_live_manifest()` → capability manifest
 - `stream_audio_to_device(wav_bytes, sample_rate)` → send TTS output to speaker
-- `stream_audio_from_device()` → async iterator of audio chunks from mic
+- `stream_audio_from_device()` → async iterator of audio chunks
+- `setup_embodiment_session(session_id, manifest, character_vars)` → called on session start
+- `teardown_embodiment_session(session_id)` → called on session release
+- `push_device_settings(settings)` → push runtime config to device
+- `push_expression(expression, character_vars)` → send avatar expression to device
 
 **Current adapters:**
 
 | Protocol | File | Notes |
 |----------|------|-------|
-| `wled` | `adapters/wled.py` | Full: display_image, display_text, display_animation, set_effect, clear. DNRGB UDP streaming. |
+| `wled` | `adapters/wled.py` | Full: display_image, display_text, display_animation, set_effect, clear |
 | `http_rest` | `adapters/http_device.py` | Generic HTTP forwarding |
-
-Register new adapters in `adapters/registry.py`.
-
----
-
-## WLED Capabilities
-
-The WLED adapter provides 5 standard capabilities:
-
-| Capability | Description |
-|------------|-------------|
-| `display_image` | Decode base64 PNG/JPEG, resize, send via DNRGB UDP |
-| `display_text` | Render text with PIL (optional scroll, colour, font size), send frames |
-| `display_animation` | Play a sequence of base64 frames at a given FPS |
-| `set_effect` | Set WLED built-in effect (effect_id, palette, colour, brightness) |
-| `clear` | Black out the matrix |
-
-Connection config keys: `http_port` (default 80), `udp_port` (default 21324), `width` (default 64), `height` (default 64).
+| `esp_http` | `adapters/esp.py` | Stub — hardware spec not yet confirmed |
+| `esp_ws` | `adapters/esp.py` | Stub — hardware spec not yet confirmed |
 
 ---
 
@@ -116,99 +156,135 @@ Connection config keys: `http_port` (default 80), `udp_port` (default 21324), `w
 | DELETE | `/api/devices/{id}` | Admin | Delete device + retire TG tools |
 | POST | `/api/devices/{id}/ping` | Admin | Ping device, update status |
 | POST | `/api/devices/{id}/sync` | Admin | Force capability sync to ToolGateway |
+| POST | `/api/devices/{slug}/events` | None | Post device event (wake-word, button press) |
+| POST | `/api/devices/{slug}/audio_upload` | None | HTTP audio upload → STT→AM→TTS pipeline |
 
-**Register body (example — WLED):**
+### Device Groups
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/groups` | None | List all groups |
+| POST | `/api/groups` | Admin | Create group |
+| GET | `/api/groups/{group_id}` | None | Get group with members |
+| PATCH | `/api/groups/{group_id}` | Admin | Update group |
+| DELETE | `/api/groups/{group_id}` | Admin | Delete group |
+| POST | `/api/groups/{group_id}/devices` | Admin | Add device to group with role |
+| DELETE | `/api/groups/{group_id}/devices/{device_id}` | Admin | Remove device from group |
+
+### Embodiment Sessions
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/embodiment/sessions` | User | List sessions (filter `?state=`) |
+| POST | `/api/embodiment/sessions` | User | Create / claim session |
+| GET | `/api/embodiment/sessions/{id}` | User | Get session detail |
+| DELETE | `/api/embodiment/sessions/{id}` | User | Release session |
+| POST | `/api/embodiment/sessions/{id}/re_embody` | User | Move primary device |
+| POST | `/api/embodiment/sessions/{id}/aux_connect` | User | Add aux device |
+| DELETE | `/api/embodiment/sessions/{id}/aux/{device_id}` | User | Remove aux device |
+| POST | `/api/embodiment/sessions/{id}/configure` | User | Push settings to primary device |
+| POST | `/api/embodiment/sessions/{id}/speak` | User | TTS to primary device speaker |
+| POST | `/api/embodiment/sessions/{id}/show_avatar` | User | Update avatar expression |
+| POST | `/api/embodiment/sessions/{id}/show_image` | User | Display image on primary device |
+| POST | `/api/embodiment/sessions/{id}/show_text` | User | Display text on primary device |
+| WS | `/api/embodiment/sessions/{id}/stream` | None | Bidirectional audio stream |
+
+**Create session body:**
 ```json
 {
-  "name": "LED Matrix 01",
-  "slug": "led-matrix-01",
-  "type": "display",
-  "protocol": "wled",
-  "host": "192.168.1.50",
-  "connection_json": {"http_port": 80, "udp_port": 21324, "width": 64, "height": 64}
+  "agent_id": "chef-agent",
+  "device_id": "...",
+  "group_id": "...",
+  "z_index": 0,
+  "permission_plan": "active",
+  "timeout_seconds": null,
+  "am_session_id": null
 }
 ```
 
-Capabilities are auto-fetched from the device if not provided. For WLED, querying `/json/info` returns matrix dimensions and the 5 standard capabilities are registered automatically.
+### Canonical `embody.*` Tools (ToolGateway)
 
-### Execution
+DBS registers these 9 tools in ToolGateway on startup:
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/execute/{slug}/{capability}` | None* | Execute a capability on a device |
+| Tool | Maps to |
+|------|---------|
+| `embody.session_create` | `POST /api/embodiment/sessions` |
+| `embody.session_release` | `DELETE /api/embodiment/sessions/{id}` |
+| `embody.speak` | `POST /api/embodiment/sessions/{id}/speak` |
+| `embody.show_avatar` | `POST /api/embodiment/sessions/{id}/show_avatar` |
+| `embody.show_image` | `POST /api/embodiment/sessions/{id}/show_image` |
+| `embody.show_text` | `POST /api/embodiment/sessions/{id}/show_text` |
+| `embody.configure` | `POST /api/embodiment/sessions/{id}/configure` |
+| `embody.re_embody` | `POST /api/embodiment/sessions/{id}/re_embody` |
+| `embody.aux_connect` | `POST /api/embodiment/sessions/{id}/aux_connect` |
 
-*Auth is handled by ToolGateway. DBS trusts that TG only forwards valid, granted requests. `agent_id` and `session_id` are extracted from the payload and logged; they are not forwarded to the adapter.
+Tools are registered idempotently on startup (PATCH if exists, POST if new). Grants must be assigned per-agent by an admin.
 
-**Request:**
+### WebSocket Audio Stream Protocol
+
+Device connects to `WS /api/embodiment/sessions/{id}/stream`.
+
+**Device → DBS:**
 ```json
-{
-  "text": "Hello",
-  "color": "#00FF41",
-  "session_id": "optional",
-  "agent_id": "optional"
-}
+{"type": "audio_chunk", "data": "<base64 PCM>", "sample_rate": 16000}
+{"type": "audio_end"}
+{"type": "ping"}
 ```
 
-### Audio
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/devices/{id}/audio/speak` | Admin | TTS via VoiceService → device speaker |
-| POST | `/api/devices/{id}/audio/listen` | Admin | Device mic → VoiceService STT → transcript |
-
-**Speak body:**
+**DBS → Device:**
 ```json
-{"text": "Hello", "voice": "glados", "session_id": "optional"}
+{"type": "audio_chunk", "data": "<base64 WAV>"}
+{"type": "audio_end"}
+{"type": "expression", "expression": "thinking"}
+{"type": "display_text", "text": "..."}
+{"type": "ping"}
 ```
 
-**Listen body:**
-```json
-{"duration_s": 5.0, "session_id": "optional"}
-```
+On `audio_end`: accumulated chunks → WAV → VoiceService STT → AgentManager → TTS → stream audio + expression messages back to device.
 
-Device must have `audio_json.has_speaker` / `audio_json.has_mic` set to `true`.
+### Execution (legacy)
 
-### Presence
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/execute/{slug}/{capability}` | Execute a `device.*` capability directly |
 
-Tracks which agent session is currently active on a device.
+### Audio (legacy)
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/presence` | None | List active presences |
-| POST | `/api/presence` | None | Assign session to device |
-| GET | `/api/presence/{session_id}` | None | Get presence for session |
-| DELETE | `/api/presence/{session_id}` | None | Release presence |
-| POST | `/api/presence/{session_id}/transfer` | None | Move session to different device |
-
-### Logs
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/logs` | None | List execution logs |
-| GET | `/api/logs/{id}` | None | Single log entry |
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/devices/{id}/audio/speak` | TTS via VoiceService → device speaker |
+| POST | `/api/devices/{id}/audio/listen` | Device mic → VoiceService STT → transcript |
 
 ### Health
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/health` | None | Health check |
+| Method | Path |
+|--------|------|
+| GET | `/health` |
+| GET | `/api/stats` |
 
 ---
 
-## Execution Flow (via ToolGateway)
+## Execution Flow (Embodiment)
 
 ```
-Agent → ToolGateway /api/execute
-  → validates grant, runs filters
-  → HTTP POST to DBS /api/execute/{slug}/{capability}
+Agent → ToolGateway embody.speak
+  → POST DBS /api/embodiment/sessions/{id}/speak
+    → VoiceService /tts → WAV bytes
+    → adapter.stream_audio_to_device(wav_bytes)
+    → adapter.push_expression(expression)  [if set]
+    → parallel dispatch to aux speakers    [if aux_device_ids]
+  → returns {ok: true}
+```
+
+## Execution Flow (Direct Device Tool)
+
+```
+Agent → ToolGateway device.{slug}.{capability}
+  → POST DBS /api/execute/{slug}/{capability}
     → resolves Device by slug
-    → gets adapter (protocol)
-    → calls adapter.execute(capability, payload)
-      → adapter dispatches to device (UDP/HTTP/WS)
+    → adapter.execute(capability, payload)
     → logs to DeviceExecutionLog
-    → returns result to TG
-  → TG logs to ToolExecutionLog
-  → returns to agent
+  → returns result
 ```
 
 ---
@@ -218,7 +294,7 @@ Agent → ToolGateway /api/execute
 ```bash
 cd DeviceBridgeService
 pip install -r requirements.txt
-cp .env.example .env   # set service keys
+cp .env.example .env
 ./start.sh
 ```
 
@@ -228,3 +304,9 @@ sudo cp devicebridgeservice.service /etc/systemd/system/
 sudo systemctl enable --now devicebridgeservice.service
 ```
 
+### Tests
+
+```bash
+.venv/bin/pytest
+# 115 tests, ~4 s
+```

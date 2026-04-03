@@ -1,8 +1,31 @@
 # Embodiment Plan — DeviceBridgeService Extension
 
 **Author:** Architecture session with Claude Code, 2026-04-03  
-**Status:** Ready for implementation  
+**Status:** Implemented — v2.0.0 (2026-04-03)  
 **Implementing agent:** Read `agent101.md`, ToolGateway README, and DBS README before starting.
+
+---
+
+## Implementation Status
+
+All 14 steps completed. 115 tests passing. ESP32 adapter deferred pending hardware spec.
+
+| Step | Status | Notes |
+|------|--------|-------|
+| 1 — Manifest schema | ✅ Done | `DeviceManifest` Pydantic model in `schemas.py`; validated on device register/update |
+| 2 — New models | ✅ Done | `DeviceGroup`, `DeviceGroupMember`, `EmbodimentSession`, `EmbodimentSessionDevice`, `DeviceEvent` in `models.py` |
+| 3 — Groups router | ✅ Done | Full CRUD in `routers/groups.py`; slug uniqueness; member role management |
+| 4 — Embodiment session router | ✅ Done | `routers/embodiment.py`; create/get/list/release/re_embody/aux_connect/aux_disconnect |
+| 5 — Preemption logic | ✅ Done | Z-index comparison in `services/embodiment_manager.py`; equal-z latest wins; `OccupiedError` → 409 |
+| 6 — Avatar delivery | ✅ Done | `_fetch_agent_profile` + `_setup_avatar_on_device`; `variable_render` sends full character_vars, `simple_sprite` sends expression string |
+| 7 — Canonical speak/show endpoints | ✅ Done | speak, show_avatar, show_image, show_text, configure in `routers/embodiment.py` |
+| 8 — Device events | ✅ Done | `POST /api/devices/{slug}/events` in `routers/devices.py`; wake_word/button_press → group → default_agent_id → create/resume session |
+| 9 — WebSocket audio stream | ✅ Done | `services/stream_loop.py`; `WS /api/embodiment/sessions/{id}/stream`; accumulates chunks → STT → AM → TTS → streams back |
+| 10 — HTTP upload fallback | ✅ Done | `POST /api/devices/{slug}/audio_upload`; synchronous STT→AM→TTS; returns `{audio_b64, expression, text}` |
+| 11 — Adapter base additions | ✅ Done | `adapters/base.py`: `setup_embodiment_session`, `teardown_embodiment_session`, `push_device_settings`, `push_expression` |
+| 12 — Timeout background task | ✅ Done | `_session_timeout_task` in `main.py`; sweeps every 30 s via `expire_timed_out_sessions()` |
+| 13 — ToolGateway tool registration | ✅ Done | `services/embody_tool_sync.py`; 9 `embody.*` tools registered idempotently on startup |
+| 14 — ESP adapter | ⏳ Deferred | `adapters/esp.py` stub created; raises `NotImplementedError`; hardware spec not yet confirmed |
 
 ---
 
@@ -69,6 +92,8 @@ The existing `DevicePresence` model and `presence.py` router are superseded by t
 
 Any field can be omitted; DBS treats missing as unsupported. Validate on `POST /api/devices` and `PATCH /api/devices/{id}`.
 
+**Implementation note:** Stored as `embodiment_manifest_json` on `Device` (separate from `manifest_json` which holds capability manifests). Validated via `DeviceManifest.model_validate()` with sub-schemas `AudioInputManifest`, `AudioOutputManifest`, `AvatarManifest`, `DisplayManifest`, `CameraManifest`.
+
 ---
 
 ## Part 2 — New Models
@@ -120,31 +145,26 @@ class EmbodimentSession(Base):
 
     session_id: str        # UUID PK
     agent_id: str          # AgentManager agent ID
-    am_session_id: str | None  # AgentManager conversation session ID — links physical session to ongoing conversation
+    am_session_id: str | None  # AgentManager conversation session ID
 
-    # Primary device (where avatar lives, main audio I/O)
     primary_device_id: str | None   # FK devices
-
-    # Priority and lifecycle
     z_index: int           # default 0; higher preempts lower
     permission_plan: str   # "active" | "ambient" | "timeout"
-    expires_at: datetime | None    # set for "timeout" plan; null for others
+    expires_at: datetime | None
 
-    # State
     state: str             # "streaming" | "ambient" | "released"
-    group_id: str | None   # FK device_groups — set if session is group-scoped
+    group_id: str | None   # FK device_groups
 
     created_at: datetime
     updated_at: datetime
     released_at: datetime | None
 
     # relationships
-    devices → EmbodimentSessionDevice (list of all devices in this session)
+    devices → EmbodimentSessionDevice
+    primary_device → Device
 ```
 
 ### EmbodimentSessionDevice
-
-An embodiment session can hold multiple devices simultaneously (e.g. avatar on wall screen + music on loudspeaker).
 
 ```python
 class EmbodimentSessionDevice(Base):
@@ -169,8 +189,8 @@ class DeviceEvent(Base):
     device_slug: str
     device_id: str         # FK devices
     event_type: str        # "wake_word" | "button_press" | "motion" | "custom"
-    payload_json: str      # event data
-    session_id: str | None # resulting session if one was created
+    payload_json: str
+    session_id: str | None
     created_at: datetime
 ```
 
@@ -193,13 +213,11 @@ DELETE /api/groups/{group_id}/devices/{dev_id} → remove device from group
 
 ### 3b. Embodiment Sessions Router — `routers/embodiment.py`
 
-This is the primary new router. All endpoints require a valid JWT (standard DBS auth).
-
 ```
 GET    /api/embodiment/sessions                  → list active sessions
-POST   /api/embodiment/sessions                  → create/claim session (see below)
+POST   /api/embodiment/sessions                  → create/claim session
 GET    /api/embodiment/sessions/{session_id}     → get session detail + devices
-DELETE /api/embodiment/sessions/{session_id}     → release session (agent or admin)
+DELETE /api/embodiment/sessions/{session_id}     → release session
 
 POST   /api/embodiment/sessions/{session_id}/re_embody      → move primary device
 POST   /api/embodiment/sessions/{session_id}/aux_connect    → add aux device
@@ -220,12 +238,12 @@ Request body:
 ```json
 {
   "agent_id": "...",
-  "am_session_id": "...",          // optional; provided if continuing existing conversation
-  "device_id": "...",              // specific device, OR
-  "group_id": "...",               // group (DBS picks primary device from group's "primary" member)
-  "z_index": 0,                    // default 0
-  "permission_plan": "active",     // "active" | "ambient" | "timeout"
-  "timeout_seconds": null          // required if permission_plan = "timeout"
+  "am_session_id": "...",
+  "device_id": "...",
+  "group_id": "...",
+  "z_index": 0,
+  "permission_plan": "active",
+  "timeout_seconds": null
 }
 ```
 
@@ -233,58 +251,52 @@ Preemption logic:
 1. Find current active session on the target device (if any).
 2. If none: create and return.
 3. If existing session Z > new Z: reject 409 with `{"error": "device_occupied", "holder_agent_id": "...", "holder_z": N}`.
-4. If existing session Z ≤ new Z: release existing session (set state="released", released_at=now), then create new.
+4. If existing session Z ≤ new Z: release existing session, then create new.
 5. If Z equal: new session wins (latest takes over).
 
 On session creation, DBS immediately:
-- Sends character vars to device if `manifest.avatar.type = "variable_render"` (fetched from AgentManager `GET /agents/{agent_id}`)
+- Fetches agent profile from AgentManager `GET /agents/{agent_id}`
+- Sends character vars to device if `manifest.avatar.type = "variable_render"`
 - Calls `adapter.setup_embodiment_session()` to establish transport
-- If `am_session_id` is null and this is wake-word triggered: calls AgentManager to start a new conversation session and sets `am_session_id`
+- Creates new AgentManager conversation session if `am_session_id` is null
+- Injects system message: `"You are now embodied on device '{name}'..."`
 
 #### Session State Transitions
 
 ```
 created → streaming (normal active session)
-streaming → ambient (agent calls embody.configure({mode: "ambient"}) or interaction ends)
+streaming → ambient (interaction ends)
 ambient → streaming (new user input received)
-streaming/ambient → released (agent or user releases, or timeout expires)
+streaming/ambient → released (explicit release or timeout)
 ```
 
-Ambient state: device holds last display (avatar frozen or last image shown). Audio loop is paused. Device event (button/wake-word) resumes to streaming.
+**Implementation note:** `set_session_state()` in `embodiment_manager.py` enforces only `streaming ↔ ambient` transitions; `released` is a one-way terminal state set by `release_session()`.
 
 #### POST .../speak
 
 ```json
 {
   "text": "Yes, certainly.",
-  "voice": "glados",               // VoiceService voice name; defaults to agent's voice setting
-  "expression": "happy",           // optional; update avatar expression alongside speech
-  "aux_device_ids": ["device-id"]  // optional; also output to aux speakers simultaneously
+  "voice": "glados",
+  "expression": "happy",
+  "aux_device_ids": ["device-id"]
 }
 ```
 
-DBS:
-1. Calls VoiceService TTS → WAV bytes.
-2. If primary device supports audio output: stream/push WAV to it.
-3. If `expression` set and device supports avatar: send expression update.
-4. If `aux_device_ids` set: dispatch audio to those devices in parallel (fire-and-forget).
+DBS: calls VoiceService TTS → streams WAV to primary device → pushes expression → parallel dispatch to aux speakers.
 
 #### POST .../show_avatar
 
 ```json
 {
-  "expression": "thinking",        // must be in manifest.avatar.expression_states
-  "avatar_id": null                // reserved for future SVG/custom avatar; ignore for now
+  "expression": "thinking",
+  "avatar_id": null
 }
 ```
 
-DBS maps expression to device capability based on avatar tier:
-- `variable_render`: send `{expression: "thinking"}` to device — device renders using character vars
-- `simple_sprite`: send `{expression: "thinking"}` — device maps to its own artwork
+Validates expression against `manifest.avatar.expression_states`. Dispatches via `adapter.push_expression()`.
 
 #### POST .../configure
-
-Push settings changes to the device. DBS validates key is in `manifest.settings_writable` before sending.
 
 ```json
 {
@@ -293,42 +305,31 @@ Push settings changes to the device. DBS validates key is in `manifest.settings_
 }
 ```
 
-Calls `adapter.push_device_settings(settings_dict)`. The adapter translates this to the device's native settings endpoint/format.
+Validates keys against `manifest.settings_writable`. Calls `adapter.push_device_settings(settings_dict)`.
 
 #### POST .../re_embody
 
 ```json
 {
   "device_id": "new-device-id",
-  "release_previous": true         // default true; if false, previous becomes aux_display
+  "release_previous": true
 }
 ```
 
-- Tears down session on old primary device (`adapter.teardown_embodiment_session()`).
-- Claims new device (runs preemption check against other sessions).
-- Sets up session on new device, sends character vars, resumes audio loop.
-- Continues the same `am_session_id` — conversation is uninterrupted.
+Tears down old primary, claims new device (preemption check), resumes same `am_session_id`. If `release_previous=false`, old primary becomes `aux_display`.
+
+**Implementation note:** Router calls `db.expire_all()` before `_load_session_full()` to ensure SQLAlchemy identity map reflects the newly committed `EmbodimentSessionDevice`.
 
 ### 3c. Device Events Router — add to `routers/devices.py`
 
 ```
 POST /api/devices/{slug}/events
+POST /api/devices/{slug}/audio_upload
 ```
 
-Body:
-```json
-{
-  "event_type": "wake_word",
-  "payload": {"word": "chef"}
-}
-```
+Event handling: log → find group → get `default_agent_id` → create EmbodimentSession (if no active session) or transition `ambient → streaming` (if session exists).
 
-Handling:
-1. Log to DeviceEvent.
-2. Look up device → find group → get `default_agent_id`.
-3. If `default_agent_id` and device has no active session: auto-create EmbodimentSession (z_index=0, plan=active, am_session_id=null — DBS creates new AM session).
-4. If device already has an active session in `ambient` state: transition to `streaming`.
-5. Notify AgentManager that session has a new inbound interaction (inject system message: `"User activated device {device_name} via {event_type}. You are now embodied on this device."`).
+Audio upload: finds active session for device → runs `process_utterance()` (STT→AM→TTS) → returns `{audio_b64, expression, text}`.
 
 ---
 
@@ -336,92 +337,66 @@ Handling:
 
 **Endpoint:** `WS /api/embodiment/sessions/{session_id}/stream`
 
-This is the real-time bidirectional audio loop. It handles devices whose `manifest.audio_input.transport = "websocket_stream"`.
+### Protocol
 
-### Protocol (device connects to DBS)
-
-The device (e.g. ESP) opens the WebSocket. DBS is the server.
-
-**Device → DBS messages:**
+**Device → DBS:**
 ```json
 {"type": "audio_chunk", "data": "<base64 PCM>", "sample_rate": 16000}
-{"type": "audio_end"}     // silence detected / utterance complete
+{"type": "audio_end"}
 {"type": "ping"}
 ```
 
-**DBS → Device messages:**
+**DBS → Device:**
 ```json
-{"type": "audio_chunk", "data": "<base64 WAV/PCM>"}   // TTS output
-{"type": "audio_end"}                                   // TTS finished
-{"type": "expression", "expression": "thinking"}        // avatar update
-{"type": "display_text", "text": "..."}                 // overlay text
-{"type": "display_image", "image_b64": "..."}           // image push
-{"type": "settings_ack", "key": "silence_timeout_ms"}  // confirm settings applied
+{"type": "audio_chunk", "data": "<base64 WAV/PCM>"}
+{"type": "audio_end"}
+{"type": "expression", "expression": "thinking"}
+{"type": "display_text", "text": "..."}
 {"type": "ping"}
 ```
 
-### DBS Stream Loop
+### DBS Stream Loop (`services/stream_loop.py`)
 
-When `audio_end` received from device:
-1. Accumulate all chunks → WAV bytes.
+On `audio_end`:
+1. Accumulate all chunks → WAV bytes (struct-packed header).
 2. POST to VoiceService `/stt` → transcript.
 3. POST transcript to AgentManager `POST /sessions/{am_session_id}/message`.
-4. Stream AgentManager response: as text arrives, send to VoiceService TTS.
-5. Stream TTS audio chunks back to device via `{"type": "audio_chunk", ...}`.
-6. Parse emotion/action tags from response (already done by AgentManager's response_parser); send `{"type": "expression", ...}` messages interleaved with audio.
-7. Send `{"type": "audio_end"}` when TTS completes.
+4. Stream AgentManager response; parse `{emotion:X}` and `{action:X}` tags; send `expression` messages interleaved with audio chunks.
+5. Send `audio_end` when TTS completes.
 
-Implement in a new service: `services/stream_loop.py`.
+Tags are stripped from text before TTS. `extract_emotions()` finds tags; `strip_tags()` removes them and collapses double spaces.
 
-### HTTP Upload Flow (alternative transport)
+### HTTP Upload Flow
 
-For devices with `audio_input.transport = "http_upload"`:
-- Device POSTs WAV file to `POST /api/devices/{slug}/audio_upload` (new endpoint in devices.py).
-- DBS runs the same STT → AgentManager → TTS pipeline synchronously.
-- Returns `{"audio_b64": "...", "expression": "happy", "text": "..."}` in the HTTP response.
-- Device plays back audio from the response body.
-
-This is a simpler request/response model for devices that can't maintain a WebSocket.
+Device POSTs WAV to `POST /api/devices/{slug}/audio_upload`. DBS runs the same pipeline synchronously. Returns `{audio_b64, expression, text}`.
 
 ---
 
 ## Part 5 — Adapter Additions
 
-Add these methods to `adapters/base.py`:
+Added to `adapters/base.py`:
 
 ```python
-async def setup_embodiment_session(
-    self,
-    session_id: str,
-    manifest: dict,
-    character_vars: dict | None,
-) -> None:
-    """Called when an embodiment session starts on this device.
-    Establish transport, send initial character vars if supported."""
+async def setup_embodiment_session(self, session_id, manifest, character_vars) -> None:
     pass  # default: no-op
 
-async def teardown_embodiment_session(self, session_id: str) -> None:
-    """Called when session is released or transferred."""
+async def teardown_embodiment_session(self, session_id) -> None:
     pass
 
-async def push_device_settings(self, settings: dict) -> dict:
-    """Push runtime settings to device. Returns {ok: True} or raises."""
-    raise NotImplementedError(f"{self.__class__.__name__} does not support settings push")
+async def push_device_settings(self, settings) -> dict:
+    raise NotImplementedError(...)
 
-async def push_expression(self, expression: str, character_vars: dict | None = None) -> None:
-    """Send an expression/emotion state to the device display."""
-    raise NotImplementedError(f"{self.__class__.__name__} does not support expression push")
+async def push_expression(self, expression, character_vars=None) -> None:
+    pass  # default: no-op
 ```
 
-The existing `stream_audio_to_device` and `stream_audio_from_device` on the base adapter remain as-is and continue to be used by the audio router for one-shot speak/listen.
+**Implementation note:** `push_device_settings` raises `NotImplementedError` by default (returns 501 to caller). `push_expression` is a no-op by default (silently does nothing if device doesn't support expressions).
 
 ---
 
 ## Part 6 — ToolGateway: Register embody.* Tools
 
-After DBS is deployed with the new endpoints, register the following canonical tools in ToolGateway. These are `kind="http"` tools pointing to DBS. Use the existing tool registration API (`POST /api/tools` on ToolGateway).
-
-These tools are granted **per-agent** by an admin — not auto-granted. The grant process is the same as any other ToolGateway tool.
+9 tools registered in ToolGateway on DBS startup via `services/embody_tool_sync.py`. Registration is idempotent (PATCH if tool exists, POST if new).
 
 | Tool name | DBS endpoint | Description |
 |---|---|---|
@@ -435,77 +410,43 @@ These tools are granted **per-agent** by an admin — not auto-granted. The gran
 | `embody.re_embody` | `POST /api/embodiment/sessions/{session_id}/re_embody` | Move to different device |
 | `embody.aux_connect` | `POST /api/embodiment/sessions/{session_id}/aux_connect` | Add auxiliary device |
 
-Note: `session_id` in endpoint URLs is supplied by the agent as a parameter — the agent receives `session_id` in the response from `embody.session_create` and passes it in subsequent calls.
-
-**skill_md for `embody.session_create`** (inject into agent context at session start):
-```markdown
-## Embodiment
-
-You can take physical presence on a device using the embody tools.
-
-1. Call `embody.session_create` with a `device_id` or `group_id` to claim a device.
-   - `z_index` (int, default 0): higher priority sessions preempt lower ones.
-   - `permission_plan`: "active" (holds until released), "timeout" (auto-releases after N seconds), "ambient" (holds display but pauses audio loop).
-2. Use the returned `session_id` in all subsequent embody calls.
-3. Call `embody.session_release` when done.
-
-You may hold embodiment across conversation turns — the session persists until you release it or it times out.
-```
+Grants must be assigned per-agent by an admin — not auto-granted.
 
 ---
 
 ## Part 7 — Avatar Delivery
 
-On `EmbodimentSession` creation, DBS fetches the agent profile:
-
-```
-GET {agentmanager_url}/agents/{agent_id}
-```
-
-The response includes `profile.appearance` (eye_count, primary_color, eye_color, etc.) and `profile.emotions` (dict of emotion names → render parameters).
+On `EmbodimentSession` creation, DBS fetches the agent profile from `GET {agentmanager_url}/agents/{agent_id}`.
 
 Based on `manifest.avatar.type`:
-
-- **`variable_render`**: Send the full `appearance` dict and `emotions` dict to the device via `adapter.setup_embodiment_session(..., character_vars=profile)`. The device uses these to render the agent's face. The specific delivery mechanism (HTTP POST to device, part of WS handshake, etc.) is adapter-specific — ESP adapter will define this.
-
-- **`simple_sprite`**: Do not send character vars. Only send expression state strings (e.g. `"happy"`, `"thinking"`) via `adapter.push_expression(state)`. The device maps these to its own artwork — the face looks the same regardless of which agent is embodied.
-
+- **`variable_render`**: Send full `appearance` + `emotions` dicts as `character_vars` to `adapter.setup_embodiment_session()` and `adapter.push_expression("neutral", character_vars=...)`.
+- **`simple_sprite`**: Send only expression string `adapter.push_expression("neutral")`.
 - **`none`**: Send nothing avatar-related.
+- **`agent_controlled`**: Log warning, treat as `none`.
 
-- **`agent_controlled`**: Reserved. Not implementing now. Log a warning and proceed as `none`.
-
-During the session, AgentManager responses contain parsed emotion tags (e.g. `{emotion:curious}`) — these are already extracted by `response_parser.py` and included in the streaming response. DBS should watch for these and call `adapter.push_expression(emotion_name)` alongside audio delivery.
+Emotion tags in AgentManager responses (`{emotion:happy}`) are parsed by `extract_emotions()` in `stream_loop.py` and sent as `expression` messages during the audio pipeline.
 
 ---
 
 ## Part 8 — Session Timeout Background Task
 
-Add to `main.py` startup a background task (asyncio loop, runs every 30 seconds):
-
-1. Query `EmbodimentSession` where `state != "released"` and `permission_plan = "timeout"` and `expires_at < now()`.
-2. For each expired session: call `release_session(session_id)` — same logic as `DELETE /api/embodiment/sessions/{id}`.
-3. Log the release with `source="timeout"`.
-
-Also: `ambient` sessions do not expire on their own unless they have `permission_plan = "timeout"`. A device with an ambient session showing a display image will hold it indefinitely unless the session is explicitly released or the timeout fires.
+`_session_timeout_task()` in `main.py` runs every 30 seconds. Calls `expire_timed_out_sessions(db)` in `embodiment_manager.py` which queries for sessions where `state != "released"` and `permission_plan = "timeout"` and `expires_at <= now()`, then calls `release_session()` for each.
 
 ---
 
 ## Part 9 — ESP Adapter (Deferred)
 
-**Do not implement this yet.** Hardware spec is not finalised.
+**Not yet implemented.** Stub in `adapters/esp.py` — all methods raise `NotImplementedError("hardware spec not yet confirmed")`. Registered in `adapters/registry.py` as `esp_http` and `esp_ws`.
 
-When ready, create `adapters/esp.py` with `protocol = "esp_http"` or `"esp_ws"`. The ESP declares its manifest at registration (DBS does not auto-detect for ESP — the firmware provides it).
+When ready, the adapter will implement all base methods. The ESP declares its manifest at registration (no auto-detect — firmware provides it).
 
-The ESP adapter will implement:
-- `fetch_live_manifest()` → HTTP GET `http://{host}/manifest`
-- `setup_embodiment_session(session_id, manifest, character_vars)` — sends character vars to device if `variable_render`
-- `teardown_embodiment_session(session_id)`
-- `push_device_settings(settings)` → HTTP POST `http://{host}/settings`
-- `push_expression(expression, character_vars)` → HTTP POST `http://{host}/expression`
-- `stream_audio_to_device(wav_bytes, sample_rate)` → HTTP POST `http://{host}/audio/play`
-- `stream_audio_from_device()` → HTTP GET streaming or WS
-
-Register `"esp_http"` and `"esp_ws"` in `adapters/registry.py` when implemented.
+Expected ESP endpoints:
+- `GET /manifest` — fetch live manifest
+- `GET /health` — health check
+- `POST /execute/{cap}` — capability execution
+- `POST /audio/play` — send TTS audio
+- `POST /settings` — push runtime settings
+- `POST /expression` — push avatar expression
 
 ---
 
@@ -533,53 +474,58 @@ This traces the full flow end-to-end to validate the architecture works for the 
 14. DBS: displays steak rarity image on cooker-screen. Session transitions to `ambient` with `permission_plan=timeout, expires_at=+30min`.
 15. Image holds on screen. After 30 minutes, background task releases the session.
 
+All steps in this scenario are now implemented and covered by tests.
+
 ---
 
 ## Implementation Order
 
-Implement in this sequence to avoid forward dependencies:
+Implemented in this sequence:
 
-1. **Manifest schema** — define Pydantic model, validate on device registration. No DB changes.
-2. **New models** — `DeviceGroup`, `DeviceGroupMember`, `EmbodimentSession`, `EmbodimentSessionDevice`, `DeviceEvent`. Migrate DB.
-3. **Groups router** — simple CRUD, no logic.
-4. **EmbodimentSession router** — create, get, list, release, re_embody. No audio yet.
-5. **Preemption logic** — implement Z-index check in session creation.
-6. **Avatar delivery** — fetch profile from AgentManager on session create, dispatch to adapter.
-7. **Canonical speak/show endpoints** — speak, show_avatar, show_image, show_text.
-8. **Device events** — wake-word routing, ambient resume.
-9. **WebSocket audio stream** — `services/stream_loop.py` and WS endpoint.
-10. **HTTP upload alternative** — simpler fallback for non-WS devices.
-11. **Adapter base additions** — setup/teardown/push_settings/push_expression.
-12. **Timeout background task** — asyncio loop in main.py.
-13. **ToolGateway tool registration** — register `embody.*` tools via API.
-14. **ESP adapter** — deferred until hardware spec confirmed.
+1. **Manifest schema** ✅ — Pydantic model, validated on device registration.
+2. **New models** ✅ — `DeviceGroup`, `DeviceGroupMember`, `EmbodimentSession`, `EmbodimentSessionDevice`, `DeviceEvent`.
+3. **Groups router** ✅ — full CRUD.
+4. **EmbodimentSession router** ✅ — create, get, list, release, re_embody.
+5. **Preemption logic** ✅ — Z-index check in session creation.
+6. **Avatar delivery** ✅ — profile fetch from AgentManager, dispatch to adapter.
+7. **Canonical speak/show endpoints** ✅ — speak, show_avatar, show_image, show_text.
+8. **Device events** ✅ — wake-word routing, ambient resume.
+9. **WebSocket audio stream** ✅ — `services/stream_loop.py` and WS endpoint.
+10. **HTTP upload alternative** ✅ — fallback for non-WS devices.
+11. **Adapter base additions** ✅ — setup/teardown/push_settings/push_expression.
+12. **Timeout background task** ✅ — asyncio loop in `main.py`.
+13. **ToolGateway tool registration** ✅ — 9 `embody.*` tools registered on startup.
+14. **ESP adapter** ⏳ — deferred, stub only.
 
 ---
 
-## Files to Create or Modify
+## Files Created or Modified
 
-| File | Action |
-|---|---|
-| `app/models.py` | Add DeviceGroup, DeviceGroupMember, EmbodimentSession, EmbodimentSessionDevice, DeviceEvent |
-| `app/schemas.py` | Add schemas for all new models + manifest schema |
-| `app/routers/groups.py` | New — group CRUD |
-| `app/routers/embodiment.py` | New — sessions, canonical commands, WS stream |
-| `app/routers/devices.py` | Add `POST /{slug}/events`, `POST /{slug}/audio_upload` |
-| `app/services/stream_loop.py` | New — WebSocket audio pipeline logic |
-| `app/services/embodiment_manager.py` | New — session lifecycle, preemption, avatar delivery |
-| `app/services/presence_manager.py` | Extend or replace with EmbodimentSession-aware version |
-| `app/adapters/base.py` | Add setup/teardown/push_settings/push_expression abstract methods |
-| `app/adapters/esp.py` | New — deferred, stub only |
-| `app/adapters/registry.py` | Register `esp_http`, `esp_ws` entries (pointing to stub) |
-| `app/main.py` | Register new routers, add timeout background task |
-| `app/config.py` | No changes needed |
+| File | Action | Summary |
+|---|---|---|
+| `app/models.py` | Modified | Added `DeviceGroup`, `DeviceGroupMember`, `EmbodimentSession`, `EmbodimentSessionDevice`, `DeviceEvent`; `Device` gains `embodiment_manifest_json` |
+| `app/schemas.py` | Modified | Added manifest sub-schemas, group schemas, embodiment session schemas, event/audio schemas |
+| `app/routers/groups.py` | New | Group CRUD; slug uniqueness; member management |
+| `app/routers/embodiment.py` | New | Sessions, canonical commands, WS stream |
+| `app/routers/devices.py` | Modified | Added `POST /{slug}/events`, `POST /{slug}/audio_upload`; embodiment manifest validation |
+| `app/services/stream_loop.py` | New | WebSocket audio pipeline; STT/TTS helpers; emotion tag parsing |
+| `app/services/embodiment_manager.py` | New | Session lifecycle, preemption, avatar delivery, timeout sweep |
+| `app/services/embody_tool_sync.py` | New | Idempotent `embody.*` tool registration in ToolGateway |
+| `app/adapters/base.py` | Modified | Added setup/teardown/push_settings/push_expression |
+| `app/adapters/esp.py` | New | Stub adapters; hardware spec deferred |
+| `app/adapters/registry.py` | Modified | Registered `esp_http`, `esp_ws` entries |
+| `app/main.py` | Modified | New routers included; timeout background task; tool registration on startup; version 2.0.0 |
+| `requirements.txt` | Modified | Added `pytest`, `pytest-asyncio`, `respx` |
+| `pytest.ini` | New | `asyncio_mode = auto`, `testpaths = tests` |
+| `tests/` | New | 115 tests across 6 test files; all passing |
 
 ---
 
 ## Notes for the Implementing Agent
 
 - All auth in DBS uses the existing `auth.py` pattern — check existing routers for the dependency injection pattern.
-- DBS has no auth of its own on the execute endpoint — ToolGateway is the auth layer for tool calls. However, the new WS audio stream and embodiment session endpoints should require a valid JWT (agent API key or user JWT via UserManager), consistent with how presence.py currently uses `get_admin_principal`.
+- DBS has no auth of its own on the execute endpoint — ToolGateway is the auth layer for tool calls. The new WS audio stream and embodiment session endpoints require a valid JWT (agent API key or user JWT via UserManager), consistent with how presence.py currently uses `get_admin_principal`.
 - The `agentmanager_url` setting already exists in config. To inject a system message into an AgentManager session, use `POST {agentmanager_url}/sessions/{am_session_id}/message` with a system-role message.
 - Do not break existing `device.*` tool execution — the `execute.py` router and adapter `execute()` method are unchanged.
 - The ESP firmware is entirely separate work. Do not write firmware code as part of this plan — that comes after the server-side implementation is complete and the hardware spec is confirmed.
+- **SQLAlchemy async note:** Use `StaticPool` for in-memory SQLite in tests to share a single connection across sessions. Use `db.expire_all()` (synchronous) before re-querying after a commit when `expire_on_commit=False` is set (as in test session makers).
