@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "dbs_client.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_http_client
+        esp_websocket_client
+        mbedtls
+        cJSON
+        freertos
+        nvs_flash
+)

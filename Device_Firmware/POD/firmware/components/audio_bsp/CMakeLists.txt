@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "audio_bsp.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        esp_codec_dev
+        freertos
+        esp_timer
+)

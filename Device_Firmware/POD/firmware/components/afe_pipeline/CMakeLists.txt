@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "afe_pipeline.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        esp-sr
+        freertos
+        audio_bsp
+)

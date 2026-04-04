@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "avatar.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        lvgl
+        display_bsp
+        freertos
+        esp_timer
+)

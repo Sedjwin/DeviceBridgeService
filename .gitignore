@@ -9,3 +9,5 @@ data/*.db-wal
 *.egg-info/
 dist/
 .pytest_cache/
+# Waveshare example reference (contains embedded git)
+Device_Firmware/POD/ESP32-S3-Touch-AMOLED-1.32/

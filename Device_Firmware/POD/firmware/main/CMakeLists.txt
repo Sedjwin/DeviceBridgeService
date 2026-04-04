@@ -1,0 +1,23 @@
+idf_component_register(
+    SRCS
+        "pod_main.cpp"
+        "config_manager.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        nvs_flash
+        esp_wifi
+        esp_event
+        esp_netif
+        driver
+        esp_adc
+        esp_timer
+        freertos
+        display_bsp
+        audio_bsp
+        afe_pipeline
+        wifi_manager
+        prov_server
+        dbs_client
+        avatar
+)

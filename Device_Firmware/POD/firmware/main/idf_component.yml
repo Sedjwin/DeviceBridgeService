@@ -1,0 +1,28 @@
+## IDF Component Manager manifest for POD main component
+dependencies:
+  idf:
+    version: ">=5.1.0"
+
+  ## Display driver — SH8601 AMOLED controller
+  espressif/esp_lcd_sh8601:
+    version: "*"
+
+  ## LVGL graphics library
+  lvgl/lvgl:
+    version: "~8.3.11"
+    rules:
+      - if: "idf_version >=5.0"
+
+  ## Audio codec abstraction
+  espressif/esp_codec_dev:
+    version: ">=1.0.0"
+
+  ## WebSocket client
+  espressif/esp_websocket_client:
+    version: ">=1.0.0"
+
+  ## ESP-SR (AFE + WakeNet)
+  espressif/esp-sr:
+    version: "*"
+    rules:
+      - if: "idf_version >=5.0"
