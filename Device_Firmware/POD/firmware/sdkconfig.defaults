@@ -61,5 +61,12 @@ CONFIG_AFE_RINGBUF_SIZE=50
 # Stack sizes (bytes)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# USB CDC — buttonless flashing via built-in USB Serial/JTAG (DO NOT REMOVE)
+# This enables the device to be flashed from any state without pressing BOOT.
+# ESP32-S3 built-in USB Serial/JTAG controller (no separate USB chip needed).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_NONE=y
+CONFIG_ESPTOOLPY_NO_STUB=n
+
 # LVGL — built via component manager, no lv_conf.h in SDK path
 # (lv_conf.h is provided by display_bsp component)

@@ -206,6 +206,8 @@
       <div class="nav-item" onclick="showPage('presence')"><span class="nav-icon">👁️</span>Presence</div>
       <div class="nav-item" onclick="showPage('console')"><span class="nav-icon">🖥️</span>Test Console</div>
       <div class="nav-item" onclick="showPage('logs')"><span class="nav-icon">📋</span>Execution Log</div>
+      <div class="nav-item" onclick="showPage('groups')"><span class="nav-icon">🏘️</span>Groups</div>
+      <div class="nav-item" onclick="showPage('sessions')"><span class="nav-icon">🎭</span>Sessions</div>
     </nav>
     <div class="sidebar-footer" id="sidebar-user">Not signed in</div>
   </aside>
@@ -348,7 +350,89 @@
       </div>
     </div>
 
+    <!-- Groups -->
+    <div class="page" id="page-groups">
+      <div class="page-header">
+        <div><div class="page-title">Device Groups</div><div class="page-sub">Group devices by location and assign default agents for wake-word routing</div></div>
+        <button class="btn btn-primary" onclick="openAddGroup()">＋ New Group</button>
+      </div>
+      <div class="card" style="padding:0">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Slug</th><th>Default Agent</th><th>Description</th><th>Members</th><th>Actions</th></tr></thead>
+            <tbody id="groups-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="group-members-panel" style="display:none" class="card mt-3">
+        <div class="section-title" id="group-members-title">Members</div>
+        <div class="toolbar">
+          <select id="gm-device-sel" style="width:220px"><option value="">— add device —</option></select>
+          <select id="gm-role-sel" style="width:160px">
+            <option value="primary">primary</option>
+            <option value="aux_speaker">aux_speaker</option>
+            <option value="aux_display">aux_display</option>
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="addGroupMember()">＋ Add</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Device</th><th>Slug</th><th>Role</th><th>Actions</th></tr></thead>
+            <tbody id="gm-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Embodiment Sessions -->
+    <div class="page" id="page-sessions">
+      <div class="page-header">
+        <div><div class="page-title">Embodiment Sessions</div><div class="page-sub">Active agent → device bindings with audio and avatar state</div></div>
+        <button class="btn btn-ghost btn-sm refresh-btn" onclick="loadSessions()">↻ Refresh</button>
+      </div>
+      <div class="toolbar">
+        <select id="sess-filter-state" onchange="loadSessions()" style="width:160px">
+          <option value="">All States</option>
+          <option value="streaming">streaming</option>
+          <option value="ambient">ambient</option>
+          <option value="released">released</option>
+        </select>
+        <div class="grow"></div>
+        <span id="sess-count" class="text-muted"></span>
+      </div>
+      <div class="card" style="padding:0">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Session ID</th><th>Agent</th><th>Primary Device</th><th>AM Session</th><th>State</th><th>Plan</th><th>z</th><th>Created</th><th>Actions</th></tr></thead>
+            <tbody id="sessions-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
   </main>
+</div>
+
+<!-- Add Group Modal -->
+<div class="modal-bg" id="modal-group">
+  <div class="modal">
+    <div class="modal-title">🏘️ <span id="modal-group-title">New Group</span></div>
+    <div id="modal-group-error" class="login-error"></div>
+    <div class="form-row">
+      <div class="form-group"><label>Name</label><input id="grp-name" type="text" placeholder="Living Room"/></div>
+      <div class="form-group"><label>Slug (unique)</label><input id="grp-slug" type="text" placeholder="living-room"/></div>
+    </div>
+    <div class="form-group">
+      <label>Default Agent ID <span class="text-muted">(receives wake-word events)</span></label>
+      <input id="grp-agent" type="text" placeholder="glados"/>
+      <div class="form-hint">Agent must exist in AgentManager. Leave blank to disable auto-embodiment.</div>
+    </div>
+    <div class="form-group"><label>Description</label><input id="grp-desc" type="text" placeholder="Optional"/></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-group')">Cancel</button>
+      <button class="btn btn-primary" onclick="submitGroup()">Save</button>
+    </div>
+  </div>
 </div>
 
 <!-- Add/Edit Device Modal -->
@@ -479,13 +563,15 @@ function showPage(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');
-  const idx = ['overview','devices','presence','console','logs'];
+  const idx = ['overview','devices','presence','console','logs','groups','sessions'];
   document.querySelectorAll('.nav-item')[idx.indexOf(name)]?.classList.add('active');
   if (name === 'overview')  loadOverview();
   if (name === 'devices')   loadDevicesTable();
   if (name === 'presence')  loadPresence();
   if (name === 'console')   loadConsoleDevices();
   if (name === 'logs')      loadLogs();
+  if (name === 'groups')    { loadGroups(); loadDevicesData(); }
+  if (name === 'sessions')  loadSessions();
 }
 
 // ── Overview ───────────────────────────────────────────────────────────────
@@ -508,7 +594,8 @@ function renderStats(s) {
     <div class="stat-card"><div class="stat-label">Online</div><div class="stat-value ${s.online===0?'muted':''}">${s.online}</div></div>
     <div class="stat-card"><div class="stat-label">Offline</div><div class="stat-value ${s.offline>0?'danger':'muted'}">${s.offline}</div></div>
     <div class="stat-card"><div class="stat-label">Capabilities</div><div class="stat-value">${s.total_capabilities}</div><div class="stat-sub">${s.synced_capabilities} synced to TG</div></div>
-    <div class="stat-card"><div class="stat-label">Active Presence</div><div class="stat-value ${s.active_presences>0?'':'muted'}">${s.active_presences}</div></div>
+    <div class="stat-card"><div class="stat-label">Active Sessions</div><div class="stat-value ${s.active_embodiment_sessions>0?'':'muted'}">${s.active_embodiment_sessions}</div><div class="stat-sub">embodiment</div></div>
+    <div class="stat-card"><div class="stat-label">Legacy Presence</div><div class="stat-value ${s.active_presences>0?'':'muted'}">${s.active_presences}</div></div>
     <div class="stat-card"><div class="stat-label">Executions Today</div><div class="stat-value">${s.executions_today}</div></div>
     <div class="stat-card"><div class="stat-label">Executions 7d</div><div class="stat-value">${s.executions_7d}</div></div>
     <div class="stat-card"><div class="stat-label">Failures 7d</div><div class="stat-value ${s.failed_7d>0?'danger':'muted'}">${s.failed_7d}</div></div>
@@ -942,6 +1029,210 @@ function fmtJson(str) {
 }
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Groups ─────────────────────────────────────────────────────────────────
+let allGroups = [];
+let activeGroupId = null;
+
+async function loadGroups() {
+  try {
+    allGroups = await api('/api/groups');
+    renderGroupsTable();
+  } catch(e) { console.error('loadGroups', e); }
+}
+
+function renderGroupsTable() {
+  const tb = document.getElementById('groups-table-body');
+  if (!allGroups.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="empty">No groups yet. Create one to enable wake-word routing.</td></tr>';
+    return;
+  }
+  tb.innerHTML = allGroups.map(g => `
+    <tr>
+      <td><strong>${escHtml(g.name)}</strong></td>
+      <td class="mono">${escHtml(g.slug)}</td>
+      <td class="mono">${g.default_agent_id ? `<span class="badge badge-ok">${escHtml(g.default_agent_id)}</span>` : '<span class="text-muted">—</span>'}</td>
+      <td class="text-muted">${escHtml(g.description || '')}</td>
+      <td><span class="pill">🔌 ${(g.members || []).length} device${(g.members||[]).length===1?'':'s'}</span></td>
+      <td>
+        <div class="actions">
+          <button class="btn btn-ghost btn-sm" onclick="showGroupMembers('${g.group_id}','${escHtml(g.name)}')">Members</button>
+          <button class="btn btn-warn btn-sm" onclick="editGroup('${g.group_id}')">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteGroup('${g.group_id}','${escHtml(g.name)}')">Delete</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function openAddGroup() {
+  activeGroupId = null;
+  document.getElementById('modal-group-title').textContent = 'New Group';
+  document.getElementById('modal-group-error').style.display = 'none';
+  ['grp-name','grp-slug','grp-agent','grp-desc'].forEach(id => { document.getElementById(id).value = ''; });
+  openModal('modal-group');
+}
+
+function editGroup(groupId) {
+  const g = allGroups.find(x => x.group_id === groupId);
+  if (!g) return;
+  activeGroupId = groupId;
+  document.getElementById('modal-group-title').textContent = 'Edit Group';
+  document.getElementById('modal-group-error').style.display = 'none';
+  document.getElementById('grp-name').value  = g.name || '';
+  document.getElementById('grp-slug').value  = g.slug || '';
+  document.getElementById('grp-agent').value = g.default_agent_id || '';
+  document.getElementById('grp-desc').value  = g.description || '';
+  openModal('modal-group');
+}
+
+async function submitGroup() {
+  const errEl = document.getElementById('modal-group-error');
+  errEl.style.display = 'none';
+  const payload = {
+    name:             document.getElementById('grp-name').value.trim(),
+    slug:             document.getElementById('grp-slug').value.trim(),
+    default_agent_id: document.getElementById('grp-agent').value.trim() || null,
+    description:      document.getElementById('grp-desc').value.trim() || null,
+  };
+  if (!payload.name || !payload.slug) {
+    errEl.textContent = 'Name and slug are required.'; errEl.style.display = 'block'; return;
+  }
+  try {
+    if (activeGroupId) {
+      await api(`/api/groups/${activeGroupId}`, 'PATCH', payload);
+      showToast('Group updated', 'ok');
+    } else {
+      await api('/api/groups', 'POST', payload);
+      showToast('Group created', 'ok');
+    }
+    closeModal('modal-group');
+    await loadGroups();
+  } catch(e) { errEl.textContent = String(e); errEl.style.display = 'block'; }
+}
+
+async function deleteGroup(groupId, name) {
+  if (!confirm(`Delete group "${name}"?`)) return;
+  try {
+    await api(`/api/groups/${groupId}`, 'DELETE');
+    await loadGroups();
+    document.getElementById('group-members-panel').style.display = 'none';
+    showToast(`Deleted group ${name}`, 'ok');
+  } catch(e) { showToast('Delete failed: ' + e, 'err'); }
+}
+
+async function showGroupMembers(groupId, name) {
+  activeGroupId = groupId;
+  document.getElementById('group-members-title').textContent = `Members — ${name}`;
+  updateGroupMemberDeviceDropdown();
+  try {
+    const g = await api(`/api/groups/${groupId}`);
+    const tb = document.getElementById('gm-table-body');
+    if (!g.members || !g.members.length) {
+      tb.innerHTML = '<tr><td colspan="4" class="empty">No devices in this group.</td></tr>';
+    } else {
+      tb.innerHTML = g.members.map(m => `
+        <tr>
+          <td><strong>${escHtml(m.device_name || m.device_id)}</strong></td>
+          <td class="mono">${escHtml(m.device_slug || '')}</td>
+          <td><span class="badge badge-${m.role === 'primary' ? 'ok' : 'display'}">${m.role}</span></td>
+          <td><button class="btn btn-danger btn-sm" onclick="removeGroupMember('${groupId}','${m.device_id}')">Remove</button></td>
+        </tr>
+      `).join('');
+    }
+  } catch(e) { console.error(e); }
+  const panel = document.getElementById('group-members-panel');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function updateGroupMemberDeviceDropdown() {
+  const sel = document.getElementById('gm-device-sel');
+  sel.innerHTML = '<option value="">— add device —</option>' +
+    allDevices.map(d => `<option value="${d.device_id}">${d.name} (${d.slug})</option>`).join('');
+}
+
+async function addGroupMember() {
+  if (!activeGroupId) return;
+  const deviceId = document.getElementById('gm-device-sel').value;
+  const role     = document.getElementById('gm-role-sel').value;
+  if (!deviceId) { showToast('Select a device', 'err'); return; }
+  try {
+    await api(`/api/groups/${activeGroupId}/devices`, 'POST', { device_id: deviceId, role });
+    const g = allGroups.find(x => x.group_id === activeGroupId);
+    await showGroupMembers(activeGroupId, g ? g.name : activeGroupId);
+    await loadGroups();
+    showToast('Device added to group', 'ok');
+  } catch(e) { showToast('Failed: ' + e, 'err'); }
+}
+
+async function removeGroupMember(groupId, deviceId) {
+  try {
+    await api(`/api/groups/${groupId}/devices/${deviceId}`, 'DELETE');
+    const g = allGroups.find(x => x.group_id === groupId);
+    await showGroupMembers(groupId, g ? g.name : groupId);
+    await loadGroups();
+    showToast('Device removed from group', 'ok');
+  } catch(e) { showToast('Failed: ' + e, 'err'); }
+}
+
+// ── Embodiment Sessions ────────────────────────────────────────────────────
+
+async function loadSessions() {
+  const state = document.getElementById('sess-filter-state').value;
+  let url = '/api/embodiment/sessions';
+  if (state) url += '?state=' + state;
+  try {
+    const sessions = await api(url);
+    document.getElementById('sess-count').textContent = sessions.length + ' session' + (sessions.length===1?'':'s');
+    renderSessionsTable(sessions);
+  } catch(e) { console.error('loadSessions', e); }
+}
+
+function renderSessionsTable(sessions) {
+  const tb = document.getElementById('sessions-table-body');
+  if (!sessions.length) {
+    tb.innerHTML = '<tr><td colspan="9" class="empty">No sessions found.</td></tr>';
+    return;
+  }
+  tb.innerHTML = sessions.map(s => {
+    const stateClass = s.state === 'streaming' ? 'ok' : s.state === 'ambient' ? 'warn' : 'unknown';
+    const devices = (s.devices || []).filter(d => d.is_active);
+    const auxList = devices.filter(d => d.role !== 'primary_embodiment')
+                           .map(d => escHtml(d.device_slug || d.device_id)).join(', ');
+    return `
+    <tr>
+      <td class="mono" style="font-size:0.72rem">${s.session_id.slice(0,12)}…</td>
+      <td class="mono">${escHtml(s.agent_id || '—')}</td>
+      <td>
+        <strong>${escHtml(s.primary_device_name || s.primary_device_id || '—')}</strong>
+        <div class="mono" style="font-size:0.72rem;color:#475569">${escHtml(s.primary_device_slug || '')}</div>
+        ${auxList ? `<div style="font-size:0.72rem;color:#64748b">+aux: ${auxList}</div>` : ''}
+      </td>
+      <td class="mono" style="font-size:0.72rem">${s.am_session_id ? s.am_session_id.slice(0,10)+'…' : '<span class="text-muted">—</span>'}</td>
+      <td><span class="badge badge-${stateClass}">${s.state}</span></td>
+      <td><span class="pill">${s.permission_plan}</span>${s.expires_at ? `<div class="text-muted" style="font-size:0.72rem">exp: ${fmtTime(s.expires_at)}</div>` : ''}</td>
+      <td class="text-muted">${s.z_index}</td>
+      <td class="text-muted">${fmtTime(s.created_at)}</td>
+      <td>
+        <div class="actions">
+          ${s.state !== 'released' ? `
+            <button class="btn btn-warn btn-sm" onclick="releaseSession('${s.session_id}')">Release</button>
+          ` : '<span class="text-muted" style="font-size:0.75rem">released</span>'}
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function releaseSession(sessionId) {
+  if (!confirm('Release this embodiment session?')) return;
+  try {
+    await api(`/api/embodiment/sessions/${sessionId}`, 'DELETE');
+    await loadSessions();
+    showToast('Session released', 'ok');
+  } catch(e) { showToast('Failed: ' + e, 'err'); }
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
