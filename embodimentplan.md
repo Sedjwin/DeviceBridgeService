@@ -529,3 +529,195 @@ Implemented in this sequence:
 - Do not break existing `device.*` tool execution — the `execute.py` router and adapter `execute()` method are unchanged.
 - The ESP firmware is entirely separate work. Do not write firmware code as part of this plan — that comes after the server-side implementation is complete and the hardware spec is confirmed.
 - **SQLAlchemy async note:** Use `StaticPool` for in-memory SQLite in tests to share a single connection across sessions. Use `db.expire_all()` (synchronous) before re-querying after a commit when `expire_on_commit=False` is set (as in test session makers).
+
+---
+
+## POD Firmware Handoff — 2026-04-04
+
+**Status: Firmware compiles and flashes. Device is bootlooping. Root cause identified — see below.**
+
+---
+
+### What Was Built
+
+Full ESP-IDF v5 firmware for the **Waveshare 1.32" AMOLED ESP32-S3** ("POD").
+All source lives in `Device_Firmware/POD/firmware/`.
+
+| Component | File(s) | Purpose |
+|---|---|---|
+| `display_bsp` | `components/display_bsp/` | SH8601 AMOLED init (QSPI), LVGL v8 port, mutex, 2× PSRAM draw buffers |
+| `audio_bsp` | `components/audio_bsp/` | ES7210 mic + ES8311 speaker via I2S; WAV header parse + playback |
+| `afe_pipeline` | `components/afe_pipeline/` | ESP-SR AFE noise suppression + WakeNet "Hi ESP"; energy VAD; audio ring buffer |
+| `wifi_manager` | `components/wifi_manager/` | STA WiFi, exponential-backoff reconnect |
+| `prov_server` | `components/prov_server/` | SoftAP "POD-SETUP" + HTTP captive portal for first-time WiFi/DBS config |
+| `dbs_client` | `components/dbs_client/` | HTTP device registration + wake event POST; WebSocket audio session to DBS |
+| `avatar` | `components/avatar/` | LVGL primitive-drawn animated face, 10 states, colour-coded status ring |
+| `main` | `main/pod_main.cpp` | Full state machine: BOOT→WIFI→IDLE→WAKING→LISTENING→THINKING→SPEAKING |
+| `main` | `main/config_manager.*` | NVS-backed config (WiFi, DBS host/port, slug, voice) |
+| `main` | `main/pod_config.h` | All GPIO pin numbers, timing constants, DBS protocol sizes |
+
+The DBS-side ESP adapter (`app/adapters/esp.py`) is fully implemented — HTTP push for expressions/audio/settings, WS handled server-side by `stream_loop.py`.
+
+---
+
+### Compilation Fixes Applied (History)
+
+The following changes were made during the compilation phase. All are already committed to git.
+
+1. **`esp_check.h`** added to every `.cpp` file — required for `ESP_RETURN_ON_ERROR` macro in IDF v5.
+2. **All component `CMakeLists.txt`** gained `PRIV_REQUIRES main` — needed because `pod_config.h` (pin definitions etc.) lives in `main/` and components include it. This is a known IDF workaround; a cleaner fix would be to move `pod_config.h` to its own header-only component, but it compiles correctly as-is.
+3. **`audio_bsp.cpp`** — switched from generic `audio_codec_new_es8311` / `audio_codec_new_es7210` calls to the codec-specific constructors: `es8311_codec_new(&es8311_cfg)` and `es7210_codec_new(&es7210_cfg)`. Added explicit includes `es8311_codec.h` / `es7210_adc.h`. Updated `esp_codec_dev_sample_info_t` field order to match IDF v5 struct layout.
+4. **`afe_pipeline.cpp`** — updated from ESP-SR v1 API to v2 API (significant changes):
+   - `srmodel_list_t *models = esp_srmodel_init("model")` — loads models from the `model` SPIFFS partition
+   - `afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST)` instead of `AFE_CONFIG_DEFAULT()`
+   - `esp_afe_handle_from_config(afe_cfg)` instead of `&ESP_AFE_SR_HANDLE`
+   - WakeNet loaded via `esp_srmodel_filter(models, ESP_WN_PREFIX, "hiesp")` + `esp_wn_handle_from_name()`
+   - `wakenet_state_t` return type; `s_wn_handle->clean()` instead of `reset()`
+5. **`display_bsp.cpp`** — SPI bus config struct field order adjusted for IDF v5 designated initialiser rules.
+6. **`dbs_client.cpp`** — `esp_http_client_config_t` field order adjusted.
+
+---
+
+### Bootloop Root Cause
+
+**Primary suspect: the `model` SPIFFS partition is empty.**
+
+`afe_pipeline_init()` calls `esp_srmodel_init("model")` which mounts the `model` SPIFFS partition and scans for model files. If the partition is blank (no model binary flashed), it returns an empty list. The subsequent `afe_config_init("M", models, ...)` or `esp_wn_handle_from_name()` may dereference a null pointer → crash → watchdog → bootloop.
+
+The model binary is **not** included in the normal `idf.py flash` — it must be flashed separately (see fix below).
+
+**Secondary suspect: legacy ADC API.**
+
+`pod_main.cpp` includes `driver/adc.h` and `esp_adc_cal.h` — these are the IDF v4 legacy ADC APIs. In IDF v5 they still exist but require `CONFIG_ADC_ONESHOT_CTRL_FUNC_IN_IRAM=y` and may cause a boot assertion on some builds. The `battery_init()` and `battery_read_pct()` functions use these.
+
+---
+
+### Fix: Bootloop
+
+**Step 1 — Flash the wake word model binary.**
+
+The ESP-SR model binary must be flashed to the `model` partition (offset `0x420000`). After building the firmware:
+
+```
+# After idf.py build:
+idf.py -p COM3 flash                          # flashes app only
+# Also flash the model — find it in the build dir:
+esptool.py -p COM3 write_flash 0x420000 build/srmodels/srmodels.bin
+```
+
+If `build/srmodels/srmodels.bin` doesn't exist, check `build/esp-sr/` or the esp-sr component directory. Alternatively, download it from:
+https://github.com/espressif/esp-sr/tree/master/model
+
+**Step 2 — Guard AFE init against empty model list.**
+
+In `afe_pipeline.cpp`, `esp_srmodel_init()` should be checked before use. If it returns NULL/empty, the code already falls back to button-only wakeup (the `if (!s_wn_data)` block is non-fatal). However the crash is happening *before* that check, in `afe_config_init()`. Add a null-check:
+
+```c
+srmodel_list_t *models = esp_srmodel_init("model");
+afe_config_t *afe_cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+if (!afe_cfg) {
+    ESP_LOGE(TAG, "AFE config init failed (model partition empty?)");
+    // Start task anyway — will run button-only mode
+    goto start_task;  // skip WakeNet load
+}
+```
+
+**Step 3 — Fix legacy ADC (optional, eliminates secondary suspect).**
+
+Replace `battery_init()` and `battery_read_pct()` in `pod_main.cpp` with the IDF v5 oneshot ADC driver:
+
+```c
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+static adc_oneshot_unit_handle_t s_adc_handle;
+
+static void battery_init(void) {
+    adc_oneshot_unit_init_cfg_t init_cfg = { .unit_id = ADC_UNIT_1 };
+    adc_oneshot_new_unit(&init_cfg, &s_adc_handle);
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    adc_oneshot_config_channel(s_adc_handle, VBAT_ADC_CHANNEL, &chan_cfg);
+}
+
+static int battery_read_pct(void) {
+    int raw = 0;
+    adc_oneshot_read(s_adc_handle, VBAT_ADC_CHANNEL, &raw);
+    // 4096 counts = 2500 mV (12dB atten), ×2 for divider = 5000 mV range
+    uint32_t mv = (uint32_t)raw * 5000 / 4096;
+    int pct = (int)((int32_t)mv - 3500) * 100 / 700;
+    return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+}
+```
+
+Also remove `#include "driver/adc.h"` and `#include "esp_adc_cal.h"` from `pod_main.cpp`, and add `esp_adc` to `main/CMakeLists.txt` REQUIRES.
+
+---
+
+### What Still Needs Doing
+
+| Task | Priority | Notes |
+|---|---|---|
+| Fix bootloop (model partition + ADC) | **Critical** | See fix section above |
+| First boot test — provisioning portal | High | Connect to POD-SETUP AP, browse to 192.168.4.1, enter WiFi + DBS details |
+| Register POD with DBS | High | Auto-registers on first WiFi connect; verify in DBS admin at `https://chip.iampc.uk:13381/` |
+| Create device group in DBS admin | High | Groups tab → New Group → set `default_agent_id = glados` |
+| Add POD to group | High | Groups → Members → Add pod-01 as `primary` |
+| Grant GlaDOS the `embody.*` tools | High | ToolGateway admin → Grants → add all 9 `embody.*` tools to glados |
+| End-to-end wake word test | High | Say "Hi ESP" → POD should POST wake event → DBS creates session → WS opens → conversation |
+| Tune VAD threshold | Medium | `energy > 2000` in `afe_pipeline.cpp` — may need adjustment per room noise level |
+| AEC (acoustic echo cancellation) | Low | Currently disabled; mic muted during playback as workaround. Full AEC needs dual I2S read |
+| OTA update mechanism | Low | Partition table is OTA-ready; `idf.py app-flash` or a future `embody.ota_update` DBS tool |
+
+---
+
+### Key File Locations
+
+```
+Device_Firmware/POD/firmware/
+├── main/
+│   ├── pod_config.h          ← ALL pin defs, timing, DBS protocol constants
+│   ├── pod_main.cpp          ← State machine, app_main, battery/button init
+│   └── config_manager.*      ← NVS read/write (WiFi, DBS host, slug, voice)
+├── components/
+│   ├── afe_pipeline/         ← BOOTLOOP SUSPECT — esp_srmodel_init() here
+│   ├── audio_bsp/            ← ES7210 + ES8311 codec init
+│   ├── display_bsp/          ← SH8601 + LVGL
+│   ├── dbs_client/           ← HTTP + WebSocket to DBS
+│   ├── avatar/               ← LVGL face drawing, 10 expression states
+│   └── prov_server/          ← SoftAP + captive portal
+├── sdkconfig.defaults        ← CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y (CDC, DO NOT REMOVE)
+└── partitions.csv            ← model partition at 0x420000, size 0x300000
+```
+
+---
+
+### Build & Flash (Windows, COM3)
+
+```powershell
+# In ESP-IDF PowerShell terminal:
+cd path\to\DeviceBridgeService\Device_Firmware\POD\firmware
+
+idf.py set-target esp32s3
+idf.py -C main update-dependencies    # downloads lvgl, sh8601, esp-sr, etc.
+idf.py build
+
+# Flash app + partition table + bootloader:
+idf.py -p COM3 flash
+
+# Flash wake word model (REQUIRED — fixes bootloop):
+esptool.py -p COM3 --chip esp32s3 write_flash 0x420000 build\srmodels\srmodels.bin
+
+# Monitor serial output:
+idf.py -p COM3 monitor
+```
+
+First boot sequence (correct behaviour after fix):
+1. Yellow ring, "POD-SETUP" text on screen
+2. Connect laptop/phone to WiFi "POD-SETUP" (pw: pod12345)
+3. Browse to http://192.168.4.1 — fill in form — Save
+4. POD reboots, connects to WiFi, teal ring
+5. Says "Hi ESP" → blue ring (listening) → speaks response
